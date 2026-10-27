@@ -6,6 +6,7 @@ import {
   Edit3,
   Archive,
   RotateCcw,
+  Trash2,
   Users,
   X,
   ArrowLeft,
@@ -51,6 +52,8 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
   const [editingCustomer, setEditingCustomer] = useState<Customer | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [pageError, setPageError] = useState('');
+  const [pageNotice, setPageNotice] = useState('');
   const [idemKey, setIdemKey] = useState('');
 
   // Form fields
@@ -64,13 +67,16 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
 
   const fetchCustomers = () => {
     setLoading(true);
+    setPageError('');
     const params = new URLSearchParams();
     params.set('status', statusFilter);
     if (search.trim()) params.set('search', search.trim());
 
     apiFetch<{ customers: Customer[] }>(`/api/customers?${params.toString()}`)
       .then((res) => setCustomers(res.customers || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setPageError(err.message || 'Failed to load customer records.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -158,6 +164,9 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
         });
       }
       setModalOpen(false);
+      setPageNotice(
+        editingCustomer ? 'Customer profile updated.' : 'Customer registered successfully.'
+      );
       fetchCustomers();
     } catch (err: any) {
       setError(err.message || 'Failed to save customer.');
@@ -168,17 +177,46 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
 
   const toggleArchive = async (c: Customer) => {
     const nextArchived = c.is_archived ? 0 : 1;
+    setPageError('');
+    setPageNotice('');
     try {
       await apiFetch(`/api/customers/${c.id}/archive`, {
         method: 'PATCH',
         body: JSON.stringify({ is_archived: nextArchived }),
       });
+      setPageNotice(
+        nextArchived
+          ? `Archived customer "${c.customer_name}".`
+          : `Restored customer "${c.customer_name}".`
+      );
       fetchCustomers();
       if (detailData?.customer.id === c.id) {
         openCustomerDetail(c.id);
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to update customer status.');
+      setPageError(err.message || 'Failed to update customer status.');
+    }
+  };
+
+  const handleDeleteCustomer = async (c: Customer) => {
+    if (
+      !window.confirm(
+        `Delete customer "${c.customer_name}" (${c.customer_code})? This cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    setPageError('');
+    setPageNotice('');
+    try {
+      await apiFetch(`/api/customers/${c.id}`, { method: 'DELETE' });
+      if (detailData?.customer.id === c.id) {
+        setDetailData(null);
+      }
+      setPageNotice(`Deleted customer "${c.customer_name}".`);
+      fetchCustomers();
+    } catch (err: any) {
+      setPageError(err.message || 'Failed to delete customer.');
     }
   };
 
@@ -401,8 +439,27 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
             >
               Edit Profile
             </button>
+            <button
+              type="button"
+              onClick={() => handleDeleteCustomer(c)}
+              className="inline-flex items-center gap-1 px-3 py-1.5 rounded border border-rose-300 bg-rose-50 text-xs font-medium text-rose-700 hover:bg-rose-100"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete
+            </button>
           </div>
         </div>
+
+        {pageError && (
+          <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs">
+            {pageError}
+          </div>
+        )}
+        {pageNotice && (
+          <div className="p-3 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs">
+            {pageNotice}
+          </div>
+        )}
 
         {/* Profile & Financial Summary */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -602,6 +659,17 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
     <div className="space-y-5">
       {renderModal()}
 
+      {pageError && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs">
+          {pageError}
+        </div>
+      )}
+      {pageNotice && (
+        <div className="p-3 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs">
+          {pageNotice}
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
         <div>
           <h1 className="text-xl font-bold text-slate-900 tracking-tight">Customers</h1>
@@ -747,6 +815,14 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                           ) : (
                             <Archive className="w-4 h-4" />
                           )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteCustomer(c)}
+                          title="Delete Customer"
+                          className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded"
+                        >
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
                     </td>

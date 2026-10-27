@@ -26,6 +26,7 @@ import {
   formatDate,
   formatPHP,
   generateIdempotencyKey,
+  resolveAssetUrl,
   round2,
   todayYMD,
   uploadImageFile,
@@ -103,6 +104,7 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
 
   const fetchReports = () => {
     setLoading(true);
+    setError('');
     const params = new URLSearchParams();
     if (search.trim()) params.set('search', search.trim());
     if (statusFilter !== 'all') params.set('status', statusFilter);
@@ -111,7 +113,9 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
 
     apiFetch<{ service_reports: ServiceReport[] }>(`/api/service-reports?${params.toString()}`)
       .then((res) => setReports(res.service_reports || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setError(err.message || 'Failed to load service reports.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -331,13 +335,14 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
   };
 
   const handleArchive = async (sr: ServiceReport) => {
-    if (!window.confirm(`Archive service report ${sr.report_number}?`)) return;
+    if (!window.confirm(`Delete service report ${sr.report_number}?`)) return;
+    setError('');
     try {
       await apiFetch(`/api/service-reports/${sr.id}`, { method: 'DELETE' });
       fetchReports();
       if (mode === 'preview') setMode('list');
     } catch (err: any) {
-      setError(err.message || 'Failed to archive service report.');
+      setError(err.message || 'Failed to delete service report.');
     }
   };
 
@@ -347,12 +352,20 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
 
   if (mode === 'preview' && activeReport) {
     return (
-      <PrintableDocument
-        doc={{ type: 'service_report', data: activeReport }}
-        settings={settings}
-        onBack={() => setMode('list')}
-        onEdit={() => openEditById(activeReport.id)}
-      />
+      <div className="space-y-3">
+        {error && (
+          <div className="no-print p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700">
+            {error}
+          </div>
+        )}
+        <PrintableDocument
+          doc={{ type: 'service_report', data: activeReport }}
+          settings={settings}
+          onBack={() => setMode('list')}
+          onEdit={() => openEditById(activeReport.id)}
+          onDelete={() => handleArchive(activeReport)}
+        />
+      </div>
     );
   }
 
@@ -785,7 +798,7 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
                       <X className="w-3.5 h-3.5" />
                     </button>
                     <img
-                      src={ph.photo_url}
+                      src={resolveAssetUrl(ph.photo_url)}
                       alt={ph.photo_type}
                       className="w-full h-32 object-cover rounded bg-white"
                     />
@@ -849,7 +862,7 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
                 </div>
                 {technicianSigUrl ? (
                   <div className="flex items-center justify-between bg-slate-50 p-2 rounded">
-                    <img src={technicianSigUrl} alt="Technician Sig" className="h-12 object-contain" />
+                    <img src={resolveAssetUrl(technicianSigUrl)} alt="Technician Sig" className="h-12 object-contain" />
                     <button
                       type="button"
                       onClick={() => setTechnicianSigUrl('')}
@@ -882,7 +895,7 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
                 </div>
                 {customerSigUrl ? (
                   <div className="flex items-center justify-between bg-slate-50 p-2 rounded">
-                    <img src={customerSigUrl} alt="Customer Sig" className="h-12 object-contain" />
+                    <img src={resolveAssetUrl(customerSigUrl)} alt="Customer Sig" className="h-12 object-contain" />
                     <button
                       type="button"
                       onClick={() => setCustomerSigUrl('')}
@@ -939,6 +952,12 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
 
   return (
     <div className="space-y-5">
+      {error && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700">
+          {error}
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
         <div>
           <h1 className="text-xl font-bold text-slate-900 tracking-tight">Service Reports</h1>
@@ -1092,12 +1111,17 @@ export const ServiceReportsPage: React.FC<ServiceReportsPageProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
-                            downloadAuthenticatedFile(
-                              `/api/service-reports/${sr.id}/pdf`,
-                              `${sr.report_number}.pdf`
-                            )
-                          }
+                          onClick={async () => {
+                            setError('');
+                            try {
+                              await downloadAuthenticatedFile(
+                                `/api/service-reports/${sr.id}/pdf`,
+                                `${sr.report_number}.pdf`
+                              );
+                            } catch (err: any) {
+                              setError(err.message || 'Failed to download Service Report PDF.');
+                            }
+                          }}
                           title="Download PDF"
                           className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded"
                         >
