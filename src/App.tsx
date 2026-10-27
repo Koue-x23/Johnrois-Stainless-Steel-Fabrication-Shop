@@ -13,13 +13,11 @@ import {
   Menu,
   X,
   Search,
-  LogOut,
   Plus,
   ChevronDown,
 } from 'lucide-react';
 import { AuthUser, BusinessSettings, NavigationTarget, NavSection } from './types';
-import { apiFetch, formatPHP, setStoredToken } from './lib/api';
-import { LoginPage } from './pages/LoginPage';
+import { apiFetch, formatPHP } from './lib/api';
 import { DashboardPage } from './pages/DashboardPage';
 import { QuotationsPage } from './pages/QuotationsPage';
 import { InvoicesPage } from './pages/InvoicesPage';
@@ -45,19 +43,41 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: React.ComponentType<{ cl
   { id: 'settings', label: 'Business Settings', icon: Settings },
 ];
 
-export const App: React.FC = () => {
-  const [authChecking, setAuthChecking] = useState(true);
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [showInitialHint, setShowInitialHint] = useState(false);
-  const [publicBusiness, setPublicBusiness] = useState({
-    business_name: 'Johnrois Stainless Steel Fabrication Shop',
-    logo_url: '',
-    address: '',
-    contact_number: '',
-    facebook_url: 'https://www.facebook.com/johnroiscanon',
-  });
+const DEFAULT_SETTINGS: BusinessSettings = {
+  id: 1,
+  business_name: 'Johnrois Stainless Steel Fabrication Shop',
+  logo_url: '',
+  address: 'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
+  contact_number: '+63 917 421 7417',
+  email: '',
+  facebook_url: 'https://www.facebook.com/johnroiscanon',
+  maps_url: 'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
+  other_social_links: '',
+  operating_hours: 'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
+  quotation_prefix: 'QTN',
+  invoice_prefix: 'INV',
+  service_report_prefix: 'SR',
+  billing_statement_prefix: 'SOA',
+  customer_prefix: 'CUST',
+  product_prefix: 'ITEM',
+  payment_prefix: 'PAY',
+  doc_number_padding: 4,
+  include_year_in_doc_num: 1,
+  default_payment_terms: '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+  default_quotation_validity_days: 15,
+  default_invoice_due_days: 15,
+  default_notes: '',
+  authorized_representative: '',
+  authorized_title: 'Authorized Representative',
+  signature_url: '',
+  tax_enabled: 0,
+  tax_label: 'VAT',
+  tax_rate: 0,
+  updated_at: '',
+};
 
-  const [settings, setSettings] = useState<BusinessSettings | null>(null);
+export const App: React.FC = () => {
+  const [settings, setSettings] = useState<BusinessSettings>(DEFAULT_SETTINGS);
   const [activeNav, setActiveNav] = useState<NavSection>('dashboard');
   const [navPayload, setNavPayload] = useState<{
     openId?: number;
@@ -72,32 +92,16 @@ export const App: React.FC = () => {
   const [searchFocused, setSearchFocused] = useState(false);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
 
-  const checkSession = async () => {
-    setAuthChecking(true);
-    try {
-      const res = await apiFetch('/api/auth/status');
-      if (res.business) setPublicBusiness(res.business);
-      setShowInitialHint(Boolean(res.show_initial_setup_hint));
-      if (res.authenticated && res.user) {
-        setUser(res.user);
-        const setRes = await apiFetch<{ settings: BusinessSettings }>('/api/settings');
-        setSettings(setRes.settings);
-      } else {
-        setUser(null);
-      }
-    } catch (_) {
-      setUser(null);
-    } finally {
-      setAuthChecking(false);
-    }
-  };
-
   useEffect(() => {
-    checkSession();
+    apiFetch<{ settings: BusinessSettings }>('/api/settings')
+      .then((res) => {
+        if (res.settings) setSettings(res.settings);
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
-    if (!user || !globalQuery.trim()) {
+    if (!globalQuery.trim()) {
       setSearchResults([]);
       return;
     }
@@ -107,23 +111,14 @@ export const App: React.FC = () => {
         .catch(() => {});
     }, 180);
     return () => clearTimeout(timer);
-  }, [globalQuery, user]);
+  }, [globalQuery]);
 
-  const handleLoginSuccess = async (loggedInUser: AuthUser) => {
-    setUser(loggedInUser);
-    const setRes = await apiFetch<{ settings: BusinessSettings }>('/api/settings');
-    setSettings(setRes.settings);
-  };
-
-  const handleLogout = async () => {
-    try {
-      await apiFetch('/api/auth/logout', { method: 'POST' });
-    } catch (_) {
-      // ignore
-    }
-    setStoredToken('');
-    setUser(null);
-    checkSession();
+  const workspaceUser: AuthUser = {
+    id: 1,
+    username: 'workspace',
+    full_name: settings.authorized_representative || '',
+    email: settings.email || '',
+    role: 'owner',
   };
 
   const navigateTo = (target: NavigationTarget) => {
@@ -157,24 +152,6 @@ export const App: React.FC = () => {
         return 'dashboard';
     }
   };
-
-  if (authChecking) {
-    return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center text-slate-300 text-sm">
-        Initializing Johnrois Stainless Steel Fabrication Shop Management System...
-      </div>
-    );
-  }
-
-  if (!user || !settings) {
-    return (
-      <LoginPage
-        businessInfo={publicBusiness}
-        showInitialSetupHint={showInitialHint}
-        onLoginSuccess={handleLoginSuccess}
-      />
-    );
-  }
 
   return (
     <div className="app-shell min-h-screen flex bg-slate-100 text-slate-900">
@@ -245,22 +222,14 @@ export const App: React.FC = () => {
           })}
         </nav>
 
-        <div className="p-3.5 border-t border-slate-800 bg-slate-900/50 space-y-2.5">
-          <div className="flex items-center justify-between gap-2">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-white truncate">{user.full_name}</div>
-              <div className="text-[11px] text-slate-400 capitalize">{user.role}</div>
+        {settings.address && (
+          <div className="p-3.5 border-t border-slate-800 bg-slate-900/50">
+            <div className="text-[11px] font-medium text-slate-300 truncate">
+              {settings.contact_number || 'Shop Workspace'}
             </div>
-            <button
-              type="button"
-              onClick={handleLogout}
-              title="Sign Out"
-              className="p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-800"
-            >
-              <LogOut className="w-4 h-4" />
-            </button>
+            <div className="text-[10px] text-slate-500 truncate mt-0.5">{settings.address}</div>
           </div>
-        </div>
+        )}
       </aside>
 
       {/* Main Content Area */}
@@ -398,7 +367,7 @@ export const App: React.FC = () => {
 
           {activeNav === 'quotations' && (
             <QuotationsPage
-              user={user}
+              user={workspaceUser}
               settings={settings}
               initialOpenId={navPayload.openId}
               initialCreateNew={navPayload.createNew}
@@ -410,7 +379,7 @@ export const App: React.FC = () => {
 
           {activeNav === 'invoices' && (
             <InvoicesPage
-              user={user}
+              user={workspaceUser}
               settings={settings}
               initialOpenId={navPayload.openId}
               initialCreateNew={navPayload.createNew}
@@ -421,7 +390,7 @@ export const App: React.FC = () => {
 
           {activeNav === 'service-reports' && (
             <ServiceReportsPage
-              user={user}
+              user={workspaceUser}
               settings={settings}
               initialOpenId={navPayload.openId}
               initialCreateNew={navPayload.createNew}
@@ -432,7 +401,7 @@ export const App: React.FC = () => {
 
           {activeNav === 'billing-statements' && (
             <BillingStatementsPage
-              user={user}
+              user={workspaceUser}
               settings={settings}
               initialOpenId={navPayload.openId}
               initialCreateNew={navPayload.createNew}
@@ -458,7 +427,6 @@ export const App: React.FC = () => {
 
           {activeNav === 'settings' && (
             <SettingsPage
-              user={user}
               settings={settings}
               onSettingsUpdated={(s) => setSettings(s)}
             />
