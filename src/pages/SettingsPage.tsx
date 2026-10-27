@@ -40,6 +40,24 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     setForm(settings);
   }, [settings]);
 
+  const persistSettingsSnapshot = async (
+    nextForm: BusinessSettings,
+    successNotice: string
+  ) => {
+    setForm(nextForm);
+    if (!nextForm.business_name?.trim()) {
+      setNotice('Updated locally. Enter a Business Name and click "Save Business Settings" to save.');
+      return;
+    }
+    const saved = await apiFetch<{ settings: BusinessSettings }>('/api/settings', {
+      method: 'PUT',
+      body: JSON.stringify(nextForm),
+    });
+    setForm(saved.settings);
+    onSettingsUpdated(saved.settings);
+    setNotice(successNotice);
+  };
+
   const handleSaveBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
@@ -50,6 +68,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         method: 'PUT',
         body: JSON.stringify(form),
       });
+      setForm(res.settings);
       onSettingsUpdated(res.settings);
       setNotice('Business settings saved. Newly generated and printed documents now use these details.');
     } catch (err: any) {
@@ -64,15 +83,31 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     if (!file) return;
     setUploadingLogo(true);
     setError('');
+    setNotice('');
     try {
       const res = await uploadImageFile(file);
-      setForm((prev) => ({ ...prev, logo_url: res.url }));
-      setNotice('Logo uploaded. Click "Save Business Settings" below to apply.');
+      await persistSettingsSnapshot(
+        { ...form, logo_url: res.url },
+        'Official business logo uploaded and saved.'
+      );
     } catch (err: any) {
       setError(err.message || 'Failed to upload logo.');
     } finally {
       setUploadingLogo(false);
       e.target.value = '';
+    }
+  };
+
+  const handleRemoveLogo = async () => {
+    setError('');
+    setNotice('');
+    try {
+      await persistSettingsSnapshot(
+        { ...form, logo_url: '' },
+        'Business logo removed and settings saved.'
+      );
+    } catch (err: any) {
+      setError(err.message || 'Failed to update business settings.');
     }
   };
 
@@ -112,9 +147,18 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         <SignaturePadModal
           title="Authorized Representative Signature"
           onClose={() => setSigModalOpen(false)}
-          onSaved={(url) => {
-            setForm((prev) => ({ ...prev, signature_url: url }));
+          onSaved={async (url) => {
             setSigModalOpen(false);
+            setError('');
+            try {
+              await persistSettingsSnapshot(
+                { ...form, signature_url: url },
+                'Authorized signature uploaded and saved.'
+              );
+            } catch (err: any) {
+              setForm((prev) => ({ ...prev, signature_url: url }));
+              setError(err.message || 'Signature uploaded, but failed to auto-save settings.');
+            }
           }}
         />
       )}
@@ -212,7 +256,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   {form.logo_url && (
                     <button
                       type="button"
-                      onClick={() => setForm({ ...form, logo_url: '' })}
+                      onClick={handleRemoveLogo}
                       className="text-xs text-rose-600 hover:underline"
                     >
                       Remove Logo
@@ -497,7 +541,14 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 {form.signature_url && (
                   <button
                     type="button"
-                    onClick={() => setForm({ ...form, signature_url: '' })}
+                    onClick={() => {
+                      persistSettingsSnapshot(
+                        { ...form, signature_url: '' },
+                        'Authorized signature removed and settings saved.'
+                      ).catch((err: any) =>
+                        setError(err.message || 'Failed to remove signature.')
+                      );
+                    }}
                     className="text-xs text-rose-600 hover:underline"
                   >
                     Remove

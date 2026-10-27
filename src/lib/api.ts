@@ -65,6 +65,9 @@ export async function apiFetch<T = any>(
       } catch (_) {
         // ignore json parse error
       }
+    } else if (res.status === 413) {
+      errMsg =
+        'Uploaded image or request exceeds the serverless payload limit (~4 MB). Please try a slightly smaller image.';
     } else if (res.status === 404) {
       errMsg = `API endpoint not found (${url}).`;
     }
@@ -83,24 +86,33 @@ export async function apiFetch<T = any>(
   return res.json();
 }
 
+const MAX_SERVERLESS_IMAGE_BYTES = 2.4 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION = 2000;
+
 async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
   const lowerName = (file.name || '').toLowerCase();
+  const lowerType = (file.type || '').toLowerCase();
+  const isJpeg = lowerType === 'image/jpeg' || lowerType === 'image/jpg' || /\.jpe?g$/.test(lowerName);
   const isNativePdfImage =
-    ['image/png', 'image/jpeg', 'image/jpg'].includes(file.type.toLowerCase()) &&
+    ['image/png', 'image/jpeg', 'image/jpg'].includes(lowerType) &&
     /\.(png|jpe?g)$/.test(lowerName);
 
-  if (isNativePdfImage || typeof document === 'undefined') {
+  // Keep native PNG/JPEG untouched when already compact enough for Vercel's 4.5 MB payload limit
+  if ((isNativePdfImage && file.size <= MAX_SERVERLESS_IMAGE_BYTES) || typeof document === 'undefined') {
     return file;
   }
 
-  // Convert WEBP / SVG / GIF to lossless PNG so PDFKit embeds logos & photos reliably
+  // Convert WEBP / SVG / GIF to PNG (for PDFKit compatibility) and scale down oversized camera photos
   return new Promise((resolve) => {
     const objectUrl = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
       try {
-        const w = Math.max(1, img.naturalWidth || img.width || 600);
-        const h = Math.max(1, img.naturalHeight || img.height || 600);
+        const rawW = Math.max(1, img.naturalWidth || img.width || 600);
+        const rawH = Math.max(1, img.naturalHeight || img.height || 600);
+        const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(rawW, rawH));
+        const w = Math.max(1, Math.round(rawW * scale));
+        const h = Math.max(1, Math.round(rawH * scale));
         const canvas = document.createElement('canvas');
         canvas.width = w;
         canvas.height = h;
@@ -111,6 +123,32 @@ async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
           return;
         }
         ctx.drawImage(img, 0, 0, w, h);
+        const base = (file.name || 'upload').replace(/\.[^.]+$/, '');
+        const preferJpeg = isJpeg || file.size > MAX_SERVERLESS_IMAGE_BYTES;
+        const outMime = preferJpeg ? 'image/jpeg' : 'image/png';
+        const outExt = preferJpeg ? 'jpg' : 'png';
+        if (preferJpeg) {
+          // Fill white background before JPEG encode so transparent pixels don't turn black
+          const composite = document.createElement('canvas');
+          composite.width = w;
+          composite.height = h;
+          const cctx = composite.getContext('2d');
+          if (cctx) {
+            cctx.fillStyle = '#ffffff';
+            cctx.fillRect(0, 0, w, h);
+            cctx.drawImage(canvas, 0, 0);
+            composite.toBlob(
+              (blob) => {
+                URL.revokeObjectURL(objectUrl);
+                if (!blob) return resolve(file);
+                resolve(new File([blob], `${base}.${outExt}`, { type: outMime }));
+              },
+              outMime,
+              0.86
+            );
+            return;
+          }
+        }
         canvas.toBlob(
           (blob) => {
             URL.revokeObjectURL(objectUrl);
@@ -118,11 +156,10 @@ async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
               resolve(file);
               return;
             }
-            const base = (file.name || 'upload').replace(/\.[^.]+$/, '');
-            resolve(new File([blob], `${base}.png`, { type: 'image/png' }));
+            resolve(new File([blob], `${base}.${outExt}`, { type: outMime }));
           },
-          'image/png',
-          1.0
+          outMime,
+          0.92
         );
       } catch (_) {
         URL.revokeObjectURL(objectUrl);
@@ -137,14 +174,48 @@ async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
   });
 }
 
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (typeof FileReader !== 'undefined') {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error('Failed to read image file.'));
+      reader.readAsDataURL(file);
+      return;
+    }
+    file
+      .arrayBuffer()
+      .then((ab) => {
+        const bytes = new Uint8Array(ab);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const b64 = typeof btoa === 'function' ? btoa(binary) : '';
+        resolve(`data:${file.type || 'image/png'};base64,${b64}`);
+      })
+      .catch(reject);
+  });
+}
+
 export async function uploadImageFile(file: File): Promise<{ url: string; filename: string }> {
   const normalizedFile = await normalizeImageForPdfCompatibility(file);
   const formData = new FormData();
   formData.append('file', normalizedFile);
-  return apiFetch('/api/uploads', {
-    method: 'POST',
-    body: formData,
-  });
+  try {
+    return await apiFetch('/api/uploads', {
+      method: 'POST',
+      body: formData,
+    });
+  } catch (primaryErr: any) {
+    // Automatic JSON base64 fallback if an edge proxy interferes with multipart/form-data
+    if (primaryErr?.status === 503 || primaryErr?.data?.setup_required) {
+      throw primaryErr;
+    }
+    const dataUrl = await fileToDataUrl(normalizedFile);
+    return apiFetch('/api/uploads/data-url', {
+      method: 'POST',
+      body: JSON.stringify({ data_url: dataUrl, filename: normalizedFile.name }),
+    });
+  }
 }
 
 export async function uploadSignatureDataUrl(
