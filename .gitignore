@@ -1,0 +1,13 @@
+node_modules/
+app-bundle/
+dist/
+build/
+data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+uploads/*
+!uploads/.gitkeep
+!data/.gitkeep
+.env
+*.log
+.DS_Store
