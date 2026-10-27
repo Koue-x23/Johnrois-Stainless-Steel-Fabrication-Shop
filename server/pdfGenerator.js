@@ -1,11 +1,17 @@
 import PDFDocument from 'pdfkit';
 import fs from 'node:fs';
 import path from 'node:path';
-import { UPLOADS_DIR } from './db.js';
+import { fileURLToPath } from 'node:url';
+import { resolveUploadBufferFromUrl } from './db.js';
 
-const FONT_REGULAR = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
-const FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-const FONT_MONO = '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const BUNDLED_FONT_REGULAR = path.join(__dirname, 'fonts', 'DejaVuSans.ttf');
+const BUNDLED_FONT_BOLD = path.join(__dirname, 'fonts', 'DejaVuSans-Bold.ttf');
+const SYSTEM_FONT_REGULAR = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+const SYSTEM_FONT_BOLD = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
+
+const FONT_REGULAR = fs.existsSync(BUNDLED_FONT_REGULAR) ? BUNDLED_FONT_REGULAR : SYSTEM_FONT_REGULAR;
+const FONT_BOLD = fs.existsSync(BUNDLED_FONT_BOLD) ? BUNDLED_FONT_BOLD : SYSTEM_FONT_BOLD;
 
 export function formatPHP(amount) {
   const num = Number(amount) || 0;
@@ -36,17 +42,6 @@ export function formatDateDisplay(ymd) {
   });
 }
 
-function resolveUploadFilePath(urlPath) {
-  if (!urlPath || typeof urlPath !== 'string') return null;
-  if (!urlPath.startsWith('/uploads/')) return null;
-  const filename = path.basename(urlPath);
-  const full = path.join(UPLOADS_DIR, filename);
-  if (!fs.existsSync(full)) return null;
-  const ext = path.extname(filename).toLowerCase();
-  if (!['.png', '.jpg', '.jpeg'].includes(ext)) return null;
-  return full;
-}
-
 function createA4Document(title) {
   const doc = new PDFDocument({
     size: 'A4',
@@ -61,7 +56,6 @@ function createA4Document(title) {
 
   if (fs.existsSync(FONT_REGULAR)) doc.registerFont('Sans', FONT_REGULAR);
   if (fs.existsSync(FONT_BOLD)) doc.registerFont('SansBold', FONT_BOLD);
-  if (fs.existsSync(FONT_MONO)) doc.registerFont('Mono', FONT_MONO);
 
   return doc;
 }
@@ -74,18 +68,18 @@ function fontBold(doc) {
   return fs.existsSync(FONT_BOLD) ? doc.font('SansBold') : doc.font('Helvetica-Bold');
 }
 
-function drawBusinessHeader(doc, settings, docTitle, docNumber, statusLabel) {
+async function drawBusinessHeader(doc, settings, docTitle, docNumber, statusLabel) {
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
   const contentWidth = right - left;
-  let y = doc.page.margins.top;
+  const y = doc.page.margins.top;
 
-  const logoPath = resolveUploadFilePath(settings.logo_url);
+  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url);
   let textStartX = left;
 
-  if (logoPath) {
+  if (logoBuf) {
     try {
-      doc.image(logoPath, left, y, { fit: [54, 54] });
+      doc.image(logoBuf, left, y, { fit: [54, 54] });
       textStartX = left + 64;
     } catch (_) {
       textStartX = left;
@@ -160,7 +154,6 @@ function drawTwoColumnMetaBox(doc, leftTitle, leftPairs, rightTitle, rightPairs)
   const colW = (totalW - gap) / 2;
   const startY = doc.y;
 
-  // Measure left column
   let leftY = startY + 8;
   fontBold(doc).fontSize(8).fillColor('#475569').text(leftTitle.toUpperCase(), left + 10, leftY, { width: colW - 20 });
   leftY = doc.y + 4;
@@ -171,7 +164,6 @@ function drawTwoColumnMetaBox(doc, leftTitle, leftPairs, rightTitle, rightPairs)
     leftY = doc.y + 2.5;
   }
 
-  // Right column
   const rightX = left + colW + gap;
   let rightY = startY + 8;
   fontBold(doc).fontSize(8).fillColor('#475569').text(rightTitle.toUpperCase(), rightX + 10, rightY, { width: colW - 20 });
@@ -330,7 +322,7 @@ function drawTermsAndNotes(doc, sections) {
   }
 }
 
-function drawSignatureArea(doc, blocks) {
+async function drawSignatureArea(doc, blocks) {
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
   const totalW = right - left;
@@ -341,14 +333,15 @@ function drawSignatureArea(doc, blocks) {
   ensureSpace(doc, 92);
   const startY = doc.y + 10;
 
-  blocks.forEach((blk, idx) => {
+  for (let idx = 0; idx < blocks.length; idx++) {
+    const blk = blocks[idx];
     const x = left + idx * (colW + gap);
     fontRegular(doc).fontSize(8).fillColor('#475569').text(blk.heading, x, startY, { width: colW });
 
-    const sigPath = resolveUploadFilePath(blk.signatureUrl);
-    if (sigPath) {
+    const sigBuf = await resolveUploadBufferFromUrl(blk.signatureUrl);
+    if (sigBuf) {
       try {
-        doc.image(sigPath, x + 8, startY + 14, { fit: [120, 36] });
+        doc.image(sigBuf, x + 8, startY + 14, { fit: [120, 36] });
       } catch (_) {
         // ignore invalid image
       }
@@ -368,7 +361,7 @@ function drawSignatureArea(doc, blocks) {
         .fillColor('#475569')
         .text(blk.subtitle, x, lineY + 16, { width: colW });
     }
-  });
+  }
 
   doc.y = startY + 82;
 }
@@ -416,7 +409,7 @@ function finalizePdfBuffer(doc) {
 
 export async function generateQuotationPdf(quotation, items, settings) {
   const doc = createA4Document(`Quotation ${quotation.quotation_number}`);
-  drawBusinessHeader(doc, settings, 'Quotation', quotation.quotation_number, quotation.status);
+  await drawBusinessHeader(doc, settings, 'Quotation', quotation.quotation_number, quotation.status);
 
   drawTwoColumnMetaBox(
     doc,
@@ -481,7 +474,7 @@ export async function generateQuotationPdf(quotation, items, settings) {
     ['Remarks / Scope Notes', quotation.remarks],
   ]);
 
-  drawSignatureArea(doc, [
+  await drawSignatureArea(doc, [
     {
       heading: 'Prepared By:',
       name: quotation.prepared_by || '',
@@ -508,7 +501,7 @@ export async function generateQuotationPdf(quotation, items, settings) {
 
 export async function generateInvoicePdf(invoice, items, payments, settings) {
   const doc = createA4Document(`Invoice ${invoice.invoice_number}`);
-  drawBusinessHeader(doc, settings, 'Billing Invoice', invoice.invoice_number, invoice.status);
+  await drawBusinessHeader(doc, settings, 'Billing Invoice', invoice.invoice_number, invoice.status);
 
   drawTwoColumnMetaBox(
     doc,
@@ -599,7 +592,7 @@ export async function generateInvoicePdf(invoice, items, payments, settings) {
     ['Remarks', invoice.remarks],
   ]);
 
-  drawSignatureArea(doc, [
+  await drawSignatureArea(doc, [
     {
       heading: 'Prepared By:',
       name: invoice.prepared_by || '',
@@ -626,7 +619,7 @@ export async function generateInvoicePdf(invoice, items, payments, settings) {
 
 export async function generateServiceReportPdf(report, materials, photos, settings) {
   const doc = createA4Document(`Service Report ${report.report_number}`);
-  drawBusinessHeader(doc, settings, 'Service Report', report.report_number, report.status);
+  await drawBusinessHeader(doc, settings, 'Service Report', report.report_number, report.status);
 
   drawTwoColumnMetaBox(
     doc,
@@ -693,27 +686,29 @@ export async function generateServiceReportPdf(report, materials, photos, settin
     ['Remarks', report.remarks],
   ]);
 
-  // Optional Before & After Photos
-  const validPhotos = (photos || []).filter((p) => resolveUploadFilePath(p.photo_url));
-  if (validPhotos.length > 0) {
+  // Optional Before & After Photos loaded from persistent DB storage
+  const resolvedPhotos = [];
+  for (const p of photos || []) {
+    const buf = await resolveUploadBufferFromUrl(p.photo_url);
+    if (buf) resolvedPhotos.push({ ...p, buf });
+  }
+
+  if (resolvedPhotos.length > 0) {
     ensureSpace(doc, 145);
     fontBold(doc).fontSize(8.5).fillColor('#0f172a').text('BEFORE & AFTER DOCUMENTATION PHOTOS', doc.page.margins.left, doc.y);
     doc.y += 6;
     const cardW = (contentW - 16) / 2;
-    for (let i = 0; i < validPhotos.length; i += 2) {
+    for (let i = 0; i < resolvedPhotos.length; i += 2) {
       ensureSpace(doc, 130);
       const rowY = doc.y;
-      for (let j = 0; j < 2 && i + j < validPhotos.length; j++) {
-        const ph = validPhotos[i + j];
-        const phPath = resolveUploadFilePath(ph.photo_url);
+      for (let j = 0; j < 2 && i + j < resolvedPhotos.length; j++) {
+        const ph = resolvedPhotos[i + j];
         const x = doc.page.margins.left + j * (cardW + 16);
         doc.rect(x, rowY, cardW, 118).lineWidth(0.5).strokeColor('#cbd5e1').stroke();
-        if (phPath) {
-          try {
-            doc.image(phPath, x + 6, rowY + 6, { fit: [cardW - 12, 86] });
-          } catch (_) {
-            // ignore
-          }
+        try {
+          doc.image(ph.buf, x + 6, rowY + 6, { fit: [cardW - 12, 86] });
+        } catch (_) {
+          // ignore
         }
         fontBold(doc)
           .fontSize(7.5)
@@ -741,7 +736,7 @@ export async function generateServiceReportPdf(report, materials, photos, settin
     .text(ackText, doc.page.margins.left, doc.y, { width: contentW });
   doc.y += 6;
 
-  drawSignatureArea(doc, [
+  await drawSignatureArea(doc, [
     {
       heading: 'Technician / Assigned Personnel:',
       name: report.technician_name || '',
@@ -764,7 +759,7 @@ export async function generateServiceReportPdf(report, materials, photos, settin
 
 export async function generateBillingStatementPdf(statement, lines, settings) {
   const doc = createA4Document(`Billing Statement ${statement.statement_number}`);
-  drawBusinessHeader(doc, settings, 'Billing Statement', statement.statement_number, 'Statement of Account');
+  await drawBusinessHeader(doc, settings, 'Billing Statement', statement.statement_number, 'Statement of Account');
 
   drawTwoColumnMetaBox(
     doc,
@@ -827,7 +822,7 @@ export async function generateBillingStatementPdf(statement, lines, settings) {
     ['Remarks', statement.remarks],
   ]);
 
-  drawSignatureArea(doc, [
+  await drawSignatureArea(doc, [
     {
       heading: 'Prepared By:',
       name: statement.prepared_by || '',

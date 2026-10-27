@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Search, Edit3, Archive, Package, X } from 'lucide-react';
+import { Plus, Search, Edit3, Archive, RotateCcw, Trash2, Package, X } from 'lucide-react';
 import { ProductService } from '../types';
 import { apiFetch, formatPHP, generateIdempotencyKey } from '../lib/api';
 
@@ -17,11 +17,14 @@ export const ProductsPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState<'active' | 'archived' | 'all'>('active');
 
   const [modalOpen, setModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<ProductService | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [pageError, setPageError] = useState('');
+  const [pageNotice, setPageNotice] = useState('');
   const [idemKey, setIdemKey] = useState('');
 
   const [name, setName] = useState('');
@@ -33,19 +36,23 @@ export const ProductsPage: React.FC = () => {
 
   const fetchProducts = () => {
     setLoading(true);
+    setPageError('');
     const params = new URLSearchParams();
+    params.set('status', statusFilter);
     if (search.trim()) params.set('search', search.trim());
     if (categoryFilter !== 'all') params.set('category', categoryFilter);
 
     apiFetch<{ products: ProductService[] }>(`/api/products?${params.toString()}`)
       .then((res) => setProducts(res.products || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setPageError(err.message || 'Failed to load catalog items.');
+      })
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
     fetchProducts();
-  }, [categoryFilter]);
+  }, [categoryFilter, statusFilter]);
 
   const openAdd = () => {
     setEditingItem(null);
@@ -102,6 +109,9 @@ export const ProductsPage: React.FC = () => {
         });
       }
       setModalOpen(false);
+      setPageNotice(
+        editingItem ? 'Catalog item updated.' : 'Product / service added to catalog.'
+      );
       fetchProducts();
     } catch (err: any) {
       setError(err.message || 'Failed to save catalog item.');
@@ -110,10 +120,35 @@ export const ProductsPage: React.FC = () => {
     }
   };
 
-  const handleArchive = async (p: ProductService) => {
-    if (!window.confirm(`Archive catalog item "${p.name}"?`)) return;
-    await apiFetch(`/api/products/${p.id}`, { method: 'DELETE' });
-    fetchProducts();
+  const handleToggleArchive = async (p: ProductService) => {
+    const nextArchived = p.is_archived ? 0 : 1;
+    setPageError('');
+    setPageNotice('');
+    try {
+      await apiFetch(`/api/products/${p.id}/archive`, {
+        method: 'PATCH',
+        body: JSON.stringify({ is_archived: nextArchived }),
+      });
+      setPageNotice(
+        nextArchived ? `Archived item "${p.name}".` : `Restored item "${p.name}".`
+      );
+      fetchProducts();
+    } catch (err: any) {
+      setPageError(err.message || 'Failed to update item status.');
+    }
+  };
+
+  const handleDelete = async (p: ProductService) => {
+    if (!window.confirm(`Delete catalog item "${p.name}" (${p.item_code})?`)) return;
+    setPageError('');
+    setPageNotice('');
+    try {
+      await apiFetch(`/api/products/${p.id}`, { method: 'DELETE' });
+      setPageNotice(`Deleted catalog item "${p.name}".`);
+      fetchProducts();
+    } catch (err: any) {
+      setPageError(err.message || 'Failed to delete catalog item.');
+    }
   };
 
   return (
@@ -245,6 +280,17 @@ export const ProductsPage: React.FC = () => {
         </div>
       )}
 
+      {pageError && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs">
+          {pageError}
+        </div>
+      )}
+      {pageNotice && (
+        <div className="p-3 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs">
+          {pageNotice}
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
         <div>
           <h1 className="text-xl font-bold text-slate-900 tracking-tight">Products and Services</h1>
@@ -300,6 +346,16 @@ export const ProductsPage: React.FC = () => {
             </option>
           ))}
         </select>
+
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as 'active' | 'archived' | 'all')}
+          className="px-3 py-1.5 text-xs font-medium border border-slate-300 rounded bg-white"
+        >
+          <option value="active">Active Items</option>
+          <option value="archived">Archived Items</option>
+          <option value="all">All Items</option>
+        </select>
       </div>
 
       <div className="bg-white border border-slate-200 rounded-md overflow-hidden">
@@ -346,16 +402,30 @@ export const ProductsPage: React.FC = () => {
                         <button
                           type="button"
                           onClick={() => openEdit(p)}
+                          title="Edit Item"
                           className="p-1.5 text-slate-600 hover:text-sky-700 hover:bg-slate-100 rounded"
                         >
                           <Edit3 className="w-4 h-4" />
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleArchive(p)}
+                          onClick={() => handleToggleArchive(p)}
+                          title={p.is_archived ? 'Restore Item' : 'Archive Item'}
+                          className="p-1.5 text-slate-400 hover:text-amber-700 hover:bg-amber-50 rounded"
+                        >
+                          {p.is_archived ? (
+                            <RotateCcw className="w-4 h-4" />
+                          ) : (
+                            <Archive className="w-4 h-4" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDelete(p)}
+                          title="Delete Item"
                           className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded"
                         >
-                          <Archive className="w-4 h-4" />
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
                     </td>

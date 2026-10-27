@@ -20,12 +20,17 @@ export const ReportsPage: React.FC<ReportsPageProps> = ({ onNavigate }) => {
   const [dateTo, setDateTo] = useState(today);
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [exportError, setExportError] = useState('');
 
   const fetchReport = () => {
     setLoading(true);
+    setLoadError('');
     apiFetch(`/api/reports?date_from=${dateFrom}&date_to=${dateTo}`)
       .then((res) => setData(res))
-      .catch(() => {})
+      .catch((err: any) => {
+        setLoadError(err.message || 'Failed to compute report summary.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -105,9 +110,28 @@ export const ReportsPage: React.FC<ReportsPageProps> = ({ onNavigate }) => {
         </div>
       </div>
 
-      {loading || !data ? (
+      {exportError && (
+        <div className="no-print p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs">
+          {exportError}
+        </div>
+      )}
+
+      {loading ? (
         <div className="bg-white border border-slate-200 rounded-md p-8 text-center text-sm text-slate-500">
           Computing financial and operational metrics...
+        </div>
+      ) : loadError || !data ? (
+        <div className="bg-rose-50 border border-rose-200 rounded-md p-6 text-center space-y-3">
+          <div className="text-sm font-semibold text-rose-800">
+            {loadError || 'Unable to load report data.'}
+          </div>
+          <button
+            type="button"
+            onClick={fetchReport}
+            className="px-4 py-1.5 rounded bg-rose-700 text-white text-xs font-semibold hover:bg-rose-800"
+          >
+            Retry Report
+          </button>
         </div>
       ) : (
         <>
@@ -298,16 +322,22 @@ export const ReportsPage: React.FC<ReportsPageProps> = ({ onNavigate }) => {
                 ['service-reports', 'Export Service Reports CSV'],
                 ['billing-statements', 'Export Billing Statements CSV'],
                 ['customers', 'Export Customers CSV'],
+                ['products', 'Export Products & Services CSV'],
               ].map(([slug, label]) => (
                 <button
                   key={slug}
                   type="button"
-                  onClick={() =>
-                    downloadAuthenticatedFile(
-                      `/api/backup/export-csv/${slug}`,
-                      `johnrois-${slug}-${today}.csv`
-                    )
-                  }
+                  onClick={async () => {
+                    setExportError('');
+                    try {
+                      await downloadAuthenticatedFile(
+                        `/api/backup/export-csv/${slug}`,
+                        `johnrois-${slug}-${today}.csv`
+                      );
+                    } catch (err: any) {
+                      setExportError(err.message || 'CSV export failed.');
+                    }
+                  }}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-slate-50 hover:bg-slate-100 text-xs font-medium text-slate-800"
                 >
                   <Download className="w-3.5 h-3.5 text-sky-700" />

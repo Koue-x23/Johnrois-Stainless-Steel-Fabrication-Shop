@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   LayoutDashboard,
   FileText,
@@ -15,9 +15,11 @@ import {
   Search,
   Plus,
   ChevronDown,
+  AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 import { AuthUser, BusinessSettings, NavigationTarget, NavSection } from './types';
-import { apiFetch, formatPHP } from './lib/api';
+import { apiFetch, formatPHP, resolveAssetUrl } from './lib/api';
 import { DashboardPage } from './pages/DashboardPage';
 import { QuotationsPage } from './pages/QuotationsPage';
 import { InvoicesPage } from './pages/InvoicesPage';
@@ -30,7 +32,11 @@ import { ReportsPage } from './pages/ReportsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { StatusBadge } from './components/StatusBadge';
 
-const NAV_ITEMS: { id: NavSection; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+const NAV_ITEMS: {
+  id: NavSection;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'quotations', label: 'Quotations', icon: FileText },
   { id: 'invoices', label: 'Invoices', icon: Receipt },
@@ -42,6 +48,42 @@ const NAV_ITEMS: { id: NavSection; label: string; icon: React.ComponentType<{ cl
   { id: 'reports', label: 'Reports', icon: BarChart3 },
   { id: 'settings', label: 'Business Settings', icon: Settings },
 ];
+
+const VALID_SECTIONS = new Set<NavSection>(NAV_ITEMS.map((n) => n.id));
+
+function parseLocationToTarget(pathname: string): NavigationTarget {
+  const parts = pathname
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean);
+
+  if (parts.length === 0 || parts[0] === 'dashboard') {
+    return { section: 'dashboard' };
+  }
+
+  const candidate = parts[0] as NavSection;
+  if (!VALID_SECTIONS.has(candidate)) {
+    return { section: 'dashboard' };
+  }
+
+  if (parts[1] === 'new') {
+    return { section: candidate, createNew: true };
+  }
+
+  const numericId = parts[1] ? Number(parts[1]) : NaN;
+  if (Number.isInteger(numericId) && numericId > 0) {
+    return { section: candidate, openId: numericId };
+  }
+
+  return { section: candidate };
+}
+
+function buildPathFromTarget(target: NavigationTarget): string {
+  if (target.section === 'dashboard') return '/';
+  if (target.openId) return `/${target.section}/${target.openId}`;
+  if (target.createNew) return `/${target.section}/new`;
+  return `/${target.section}`;
+}
 
 const DEFAULT_SETTINGS: BusinessSettings = {
   id: 1,
@@ -63,7 +105,8 @@ const DEFAULT_SETTINGS: BusinessSettings = {
   payment_prefix: 'PAY',
   doc_number_padding: 4,
   include_year_in_doc_num: 1,
-  default_payment_terms: '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+  default_payment_terms:
+    '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
   default_quotation_validity_days: 15,
   default_invoice_due_days: 15,
   default_notes: '',
@@ -76,14 +119,32 @@ const DEFAULT_SETTINGS: BusinessSettings = {
   updated_at: '',
 };
 
+interface StorageInfo {
+  engine: string;
+  persistent: boolean;
+  is_serverless: boolean;
+  setup_required: boolean;
+  message: string;
+}
+
 export const App: React.FC = () => {
+  const initialTarget =
+    typeof window !== 'undefined'
+      ? parseLocationToTarget(window.location.pathname)
+      : { section: 'dashboard' as NavSection };
+
   const [settings, setSettings] = useState<BusinessSettings>(DEFAULT_SETTINGS);
-  const [activeNav, setActiveNav] = useState<NavSection>('dashboard');
+  const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null);
+  const [settingsError, setSettingsError] = useState('');
+  const [activeNav, setActiveNav] = useState<NavSection>(initialTarget.section);
   const [navPayload, setNavPayload] = useState<{
     openId?: number;
     createNew?: boolean;
     prefillCustomerId?: number;
-  }>({});
+  }>({
+    openId: initialTarget.openId,
+    createNew: initialTarget.createNew,
+  });
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Global search
@@ -92,12 +153,36 @@ export const App: React.FC = () => {
   const [searchFocused, setSearchFocused] = useState(false);
   const [quickCreateOpen, setQuickCreateOpen] = useState(false);
 
-  useEffect(() => {
-    apiFetch<{ settings: BusinessSettings }>('/api/settings')
+  const loadSettings = useCallback(() => {
+    setSettingsError('');
+    apiFetch<{ settings: BusinessSettings; storage?: StorageInfo }>('/api/settings')
       .then((res) => {
         if (res.settings) setSettings(res.settings);
+        if (res.storage) setStorageInfo(res.storage);
       })
-      .catch(() => {});
+      .catch((err: any) => {
+        setSettingsError(err.message || 'Unable to load business settings from server.');
+      });
+  }, []);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
+
+  // Keep browser Back/Forward history synchronized with module navigation
+  useEffect(() => {
+    const handlePopState = () => {
+      const parsed = parseLocationToTarget(window.location.pathname);
+      setActiveNav(parsed.section);
+      setNavPayload({
+        openId: parsed.openId,
+        createNew: parsed.createNew,
+      });
+      setSidebarOpen(false);
+      setQuickCreateOpen(false);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
   useEffect(() => {
@@ -108,7 +193,9 @@ export const App: React.FC = () => {
     const timer = setTimeout(() => {
       apiFetch<{ results: any[] }>(`/api/search?q=${encodeURIComponent(globalQuery.trim())}`)
         .then((r) => setSearchResults(r.results || []))
-        .catch(() => {});
+        .catch(() => {
+          setSearchResults([]);
+        });
     }, 180);
     return () => clearTimeout(timer);
   }, [globalQuery]);
@@ -130,10 +217,23 @@ export const App: React.FC = () => {
     });
     setSidebarOpen(false);
     setQuickCreateOpen(false);
+
+    if (typeof window !== 'undefined') {
+      const nextPath = buildPathFromTarget(target);
+      if (window.location.pathname !== nextPath) {
+        window.history.pushState({}, '', nextPath);
+      }
+    }
   };
 
   const clearNavPayload = () => {
     setNavPayload({});
+    if (typeof window !== 'undefined') {
+      const basePath = activeNav === 'dashboard' ? '/' : `/${activeNav}`;
+      if (window.location.pathname === `/${activeNav}/new`) {
+        window.history.replaceState({}, '', basePath);
+      }
+    }
   };
 
   const mapSearchTypeToSection = (t: string): NavSection => {
@@ -173,7 +273,7 @@ export const App: React.FC = () => {
           <div className="flex items-center gap-3 min-w-0">
             {settings.logo_url ? (
               <img
-                src={settings.logo_url}
+                src={resolveAssetUrl(settings.logo_url)}
                 alt={settings.business_name}
                 className="w-9 h-9 rounded bg-white p-0.5 object-contain shrink-0"
               />
@@ -283,8 +383,10 @@ export const App: React.FC = () => {
                         <div>
                           <div className="text-xs font-bold text-slate-900">{r.title}</div>
                           <div className="text-[11px] text-slate-500">
-                            <span className="uppercase font-semibold">{r.type.replace('_', ' ')}</span> •{' '}
-                            {r.subtitle}
+                            <span className="uppercase font-semibold">
+                              {r.type.replace('_', ' ')}
+                            </span>{' '}
+                            • {r.subtitle}
                           </div>
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
@@ -361,6 +463,34 @@ export const App: React.FC = () => {
           </div>
         </header>
 
+        {/* System / Storage Alerts */}
+        {settingsError && (
+          <div className="no-print mx-4 sm:mx-6 lg:mx-7 mt-4 p-3 rounded-lg bg-rose-50 border border-rose-300 text-rose-800 text-xs flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-rose-600" />
+              <span>{settingsError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={loadSettings}
+              className="inline-flex items-center gap-1.5 px-3 py-1 rounded bg-rose-700 text-white font-semibold hover:bg-rose-800"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Retry Connection
+            </button>
+          </div>
+        )}
+
+        {storageInfo?.setup_required && (
+          <div className="no-print mx-4 sm:mx-6 lg:mx-7 mt-4 p-3.5 rounded-lg bg-amber-50 border border-amber-300 text-amber-900 text-xs flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-amber-600 mt-0.5" />
+            <div>
+              <div className="font-bold">Cloud Database Setup Required for Permanent Saves</div>
+              <p className="mt-0.5 text-amber-800 leading-relaxed">{storageInfo.message}</p>
+            </div>
+          </div>
+        )}
+
         {/* Workspace View */}
         <main className="app-main-scroll flex-1 p-4 sm:p-6 lg:p-7 overflow-y-auto">
           {activeNav === 'dashboard' && <DashboardPage onNavigate={navigateTo} />}
@@ -426,10 +556,7 @@ export const App: React.FC = () => {
           {activeNav === 'reports' && <ReportsPage onNavigate={navigateTo} />}
 
           {activeNav === 'settings' && (
-            <SettingsPage
-              settings={settings}
-              onSettingsUpdated={(s) => setSettings(s)}
-            />
+            <SettingsPage settings={settings} onSettingsUpdated={(s) => setSettings(s)} />
           )}
         </main>
       </div>

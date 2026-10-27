@@ -22,12 +22,16 @@ interface DashboardPageProps {
 export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
 
   const loadDashboard = () => {
     setLoading(true);
+    setLoadError('');
     apiFetch('/api/dashboard')
       .then((res) => setData(res))
-      .catch(() => {})
+      .catch((err: any) => {
+        setLoadError(err.message || 'Failed to load dashboard metrics.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -93,6 +97,19 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({ onNavigate }) => {
 
   return (
     <div className="space-y-6">
+      {loadError && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center justify-between gap-3">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={loadDashboard}
+            className="px-3 py-1 rounded bg-rose-700 text-white font-semibold hover:bg-rose-800"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {/* Page Header & Direct Document Actions */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-200">
         <div>

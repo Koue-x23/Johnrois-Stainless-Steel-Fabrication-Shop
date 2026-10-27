@@ -122,6 +122,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
   const fetchInvoices = () => {
     setLoading(true);
+    setError('');
     const params = new URLSearchParams();
     if (search.trim()) params.set('search', search.trim());
     if (statusFilter !== 'all') params.set('status', statusFilter);
@@ -130,7 +131,9 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
     apiFetch<{ invoices: Invoice[] }>(`/api/invoices?${params.toString()}`)
       .then((res) => setInvoices(res.invoices || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setError(err.message || 'Failed to load invoices.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -377,13 +380,15 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
   };
 
   const handleArchive = async (inv: Invoice) => {
-    if (!window.confirm(`Archive invoice ${inv.invoice_number}?`)) return;
+    if (!window.confirm(`Delete invoice ${inv.invoice_number}?`)) return;
+    setError('');
     try {
       await apiFetch(`/api/invoices/${inv.id}`, { method: 'DELETE' });
+      setNotice(`Deleted invoice ${inv.invoice_number}.`);
       fetchInvoices();
       if (mode === 'preview') setMode('list');
     } catch (err: any) {
-      setError(err.message || 'Failed to archive invoice.');
+      setError(err.message || 'Failed to delete invoice.');
     }
   };
 
@@ -561,6 +566,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
             setMode('list');
           }}
           onEdit={() => openEditById(activeInvoice.id)}
+          onDelete={() => handleArchive(activeInvoice)}
           extraActions={
             activeInvoice.remaining_balance > 0.009 ? (
               <button
@@ -965,6 +971,12 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
         </button>
       </div>
 
+      {error && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700">
+          {error}
+        </div>
+      )}
+
       {notice && (
         <div className="p-3 rounded bg-emerald-50 border border-emerald-200 text-xs text-emerald-800 flex justify-between">
           <span>{notice}</span>
@@ -1127,12 +1139,17 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
-                            downloadAuthenticatedFile(
-                              `/api/invoices/${inv.id}/pdf`,
-                              `${inv.invoice_number}.pdf`
-                            )
-                          }
+                          onClick={async () => {
+                            setError('');
+                            try {
+                              await downloadAuthenticatedFile(
+                                `/api/invoices/${inv.id}/pdf`,
+                                `${inv.invoice_number}.pdf`
+                              );
+                            } catch (err: any) {
+                              setError(err.message || 'Failed to download Invoice PDF.');
+                            }
+                          }}
                           title="Download PDF"
                           className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded"
                         >

@@ -45,9 +45,12 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
   const [idemKey, setIdemKey] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
+  const [pageError, setPageError] = useState('');
+  const [pageNotice, setPageNotice] = useState('');
 
   const fetchPayments = () => {
     setLoading(true);
+    setPageError('');
     const params = new URLSearchParams();
     if (search.trim()) params.set('search', search.trim());
     if (methodFilter !== 'all') params.set('method', methodFilter);
@@ -56,7 +59,9 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
 
     apiFetch<{ payments: PaymentRecord[] }>(`/api/payments?${params.toString()}`)
       .then((res) => setPayments(res.payments || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setPageError(err.message || 'Failed to load payment records.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -66,24 +71,27 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
 
   const openRecordModal = async () => {
     setError('');
-    const res = await apiFetch<{ invoices: Invoice[] }>('/api/invoices?status=Open').catch(() => ({
-      invoices: [],
-    }));
-    const list = (res.invoices || []).filter((i) => i.remaining_balance > 0.009);
-    setOpenInvoices(list);
-    if (list.length > 0) {
-      setSelectedInvoiceId(list[0].id);
-      setAmount(round2(list[0].remaining_balance));
-    } else {
-      setSelectedInvoiceId(0);
-      setAmount(0);
+    setPageError('');
+    try {
+      const res = await apiFetch<{ invoices: Invoice[] }>('/api/invoices?status=Open');
+      const list = (res.invoices || []).filter((i) => i.remaining_balance > 0.009);
+      setOpenInvoices(list);
+      if (list.length > 0) {
+        setSelectedInvoiceId(list[0].id);
+        setAmount(round2(list[0].remaining_balance));
+      } else {
+        setSelectedInvoiceId(0);
+        setAmount(0);
+      }
+      setPayDate(todayYMD());
+      setMethod('Cash');
+      setRefNumber('');
+      setNotes('');
+      setIdemKey(generateIdempotencyKey());
+      setModalOpen(true);
+    } catch (err: any) {
+      setPageError(err.message || 'Unable to load open invoices.');
     }
-    setPayDate(todayYMD());
-    setMethod('Cash');
-    setRefNumber('');
-    setNotes('');
-    setIdemKey(generateIdempotencyKey());
-    setModalOpen(true);
   };
 
   const handleInvoicePick = (id: number) => {
@@ -113,6 +121,7 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
         }),
       });
       setModalOpen(false);
+      setPageNotice('Payment recorded and invoice balance updated.');
       fetchPayments();
     } catch (err: any) {
       setError(err.message || 'Failed to record payment.');
@@ -123,8 +132,15 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
 
   const handleVoid = async (p: PaymentRecord) => {
     if (!window.confirm(`Void payment ${p.payment_number} and recalculate invoice balance?`)) return;
-    await apiFetch(`/api/payments/${p.id}`, { method: 'DELETE' });
-    fetchPayments();
+    setPageError('');
+    setPageNotice('');
+    try {
+      await apiFetch(`/api/payments/${p.id}`, { method: 'DELETE' });
+      setPageNotice(`Voided payment ${p.payment_number} and updated invoice balance.`);
+      fetchPayments();
+    } catch (err: any) {
+      setPageError(err.message || 'Failed to void payment.');
+    }
   };
 
   const totalShown = round2(payments.reduce((s, p) => s + Number(p.amount || 0), 0));
@@ -269,6 +285,17 @@ export const PaymentsPage: React.FC<PaymentsPageProps> = ({ onNavigate }) => {
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {pageError && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-rose-800 text-xs">
+          {pageError}
+        </div>
+      )}
+      {pageNotice && (
+        <div className="p-3 rounded bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs">
+          {pageNotice}
         </div>
       )}
 

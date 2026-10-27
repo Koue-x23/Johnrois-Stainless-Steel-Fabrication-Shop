@@ -12,6 +12,7 @@ import { BusinessSettings } from '../types';
 import {
   apiFetch,
   downloadAuthenticatedFile,
+  resolveAssetUrl,
   todayYMD,
   uploadImageFile,
 } from '../lib/api';
@@ -71,6 +72,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       setError(err.message || 'Failed to upload logo.');
     } finally {
       setUploadingLogo(false);
+      e.target.value = '';
     }
   };
 
@@ -184,7 +186,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="w-20 h-20 rounded border border-slate-300 bg-slate-50 flex items-center justify-center overflow-hidden">
                 {form.logo_url ? (
                   <img
-                    src={form.logo_url}
+                    src={resolveAssetUrl(form.logo_url)}
                     alt="Business Logo"
                     className="w-full h-full object-contain"
                   />
@@ -479,7 +481,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="flex items-center gap-3">
                 {form.signature_url && (
                   <img
-                    src={form.signature_url}
+                    src={resolveAssetUrl(form.signature_url)}
                     alt="Authorized Sig"
                     className="h-10 bg-white border border-slate-300 rounded px-2 object-contain"
                   />
@@ -564,12 +566,17 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             </p>
             <button
               type="button"
-              onClick={() =>
-                downloadAuthenticatedFile(
-                  '/api/backup/export',
-                  `johnrois-backup-${todayYMD()}.json`
-                )
-              }
+              onClick={async () => {
+                setError('');
+                try {
+                  await downloadAuthenticatedFile(
+                    '/api/backup/export',
+                    `johnrois-backup-${todayYMD()}.json`
+                  );
+                } catch (err: any) {
+                  setError(err.message || 'Failed to download backup file.');
+                }
+              }}
               className="inline-flex items-center gap-2 px-4 py-2 rounded bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
             >
               <Download className="w-4 h-4" />

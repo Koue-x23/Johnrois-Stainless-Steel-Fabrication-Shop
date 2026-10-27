@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Printer, Download, ArrowLeft, Edit3 } from 'lucide-react';
+import { Printer, Download, ArrowLeft, Edit3, Trash2 } from 'lucide-react';
 import {
   BusinessSettings,
   Quotation,
@@ -7,7 +7,7 @@ import {
   ServiceReport,
   BillingStatement,
 } from '../types';
-import { downloadAuthenticatedFile, formatDate, formatPHP } from '../lib/api';
+import { downloadAuthenticatedFile, formatDate, formatPHP, resolveAssetUrl } from '../lib/api';
 
 type DocumentPayload =
   | { type: 'quotation'; data: Quotation }
@@ -20,6 +20,7 @@ interface PrintableDocumentProps {
   settings: BusinessSettings;
   onBack: () => void;
   onEdit?: () => void;
+  onDelete?: () => void;
   extraActions?: React.ReactNode;
 }
 
@@ -28,6 +29,7 @@ export const PrintableDocument: React.FC<PrintableDocumentProps> = ({
   settings,
   onBack,
   onEdit,
+  onDelete,
   extraActions,
 }) => {
   const [downloading, setDownloading] = useState(false);
@@ -121,6 +123,16 @@ export const PrintableDocument: React.FC<PrintableDocumentProps> = ({
               Edit Document
             </button>
           )}
+          {onDelete && (
+            <button
+              type="button"
+              onClick={onDelete}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded border border-rose-300 bg-rose-50 text-xs font-medium text-rose-700 hover:bg-rose-100"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete
+            </button>
+          )}
           <button
             type="button"
             onClick={handlePrint}
@@ -157,7 +169,7 @@ export const PrintableDocument: React.FC<PrintableDocumentProps> = ({
           <div className="flex items-start gap-4">
             {settings.logo_url ? (
               <img
-                src={settings.logo_url}
+                src={resolveAssetUrl(settings.logo_url)}
                 alt={settings.business_name}
                 className="w-16 h-16 object-contain shrink-0"
               />
@@ -350,7 +362,7 @@ const QuotationSheetBody: React.FC<{ quotation: Quotation; settings: BusinessSet
         <div>
           <div className="text-[11px] text-slate-600 h-8 flex items-end">
             {settings.signature_url ? (
-              <img src={settings.signature_url} alt="Signature" className="h-10 object-contain" />
+              <img src={resolveAssetUrl(settings.signature_url)} alt="Signature" className="h-10 object-contain" />
             ) : (
               <span>Authorized Signature:</span>
             )}
@@ -543,7 +555,7 @@ const InvoiceSheetBody: React.FC<{ invoice: Invoice; settings: BusinessSettings 
         <div>
           <div className="text-[11px] text-slate-600 h-8 flex items-end">
             {settings.signature_url ? (
-              <img src={settings.signature_url} alt="Signature" className="h-10 object-contain" />
+              <img src={resolveAssetUrl(settings.signature_url)} alt="Signature" className="h-10 object-contain" />
             ) : (
               <span>Authorized Signature:</span>
             )}
@@ -711,7 +723,7 @@ const ServiceReportSheetBody: React.FC<{ report: ServiceReport; settings: Busine
             {photos.map((ph, idx) => (
               <div key={idx} className="border border-slate-300 p-2">
                 <img
-                  src={ph.photo_url}
+                  src={resolveAssetUrl(ph.photo_url)}
                   alt={ph.caption || ph.photo_type}
                   className="w-full h-36 object-cover bg-slate-50"
                 />
@@ -739,7 +751,7 @@ const ServiceReportSheetBody: React.FC<{ report: ServiceReport; settings: Busine
             <div className="h-12 flex items-end">
               {report.technician_signature_url ? (
                 <img
-                  src={report.technician_signature_url}
+                  src={resolveAssetUrl(report.technician_signature_url)}
                   alt="Technician Signature"
                   className="h-11 object-contain"
                 />
@@ -757,7 +769,7 @@ const ServiceReportSheetBody: React.FC<{ report: ServiceReport; settings: Busine
             <div className="h-12 flex items-end">
               {report.customer_signature_url ? (
                 <img
-                  src={report.customer_signature_url}
+                  src={resolveAssetUrl(report.customer_signature_url)}
                   alt="Customer Signature"
                   className="h-11 object-contain"
                 />
@@ -913,7 +925,7 @@ const BillingStatementSheetBody: React.FC<{
         <div>
           <div className="text-[11px] text-slate-600 h-8 flex items-end">
             {settings.signature_url ? (
-              <img src={settings.signature_url} alt="Signature" className="h-10 object-contain" />
+              <img src={resolveAssetUrl(settings.signature_url)} alt="Signature" className="h-10 object-contain" />
             ) : (
               <span>Authorized Signature:</span>
             )}

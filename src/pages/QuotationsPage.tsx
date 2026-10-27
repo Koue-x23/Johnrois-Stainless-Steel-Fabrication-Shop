@@ -106,6 +106,7 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
 
   const fetchQuotations = () => {
     setLoading(true);
+    setError('');
     const params = new URLSearchParams();
     if (search.trim()) params.set('search', search.trim());
     if (statusFilter !== 'all') params.set('status', statusFilter);
@@ -114,7 +115,9 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
 
     apiFetch<{ quotations: Quotation[] }>(`/api/quotations?${params.toString()}`)
       .then((res) => setQuotations(res.quotations || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setError(err.message || 'Failed to load quotations.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -352,13 +355,15 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
   };
 
   const handleArchive = async (q: Quotation) => {
-    if (!window.confirm(`Archive quotation ${q.quotation_number}?`)) return;
+    if (!window.confirm(`Delete quotation ${q.quotation_number}?`)) return;
+    setError('');
     try {
       await apiFetch(`/api/quotations/${q.id}`, { method: 'DELETE' });
+      setNotice(`Deleted quotation ${q.quotation_number}.`);
       fetchQuotations();
       if (mode === 'preview') setMode('list');
     } catch (err: any) {
-      setError(err.message || 'Failed to archive quotation.');
+      setError(err.message || 'Failed to delete quotation.');
     }
   };
 
@@ -387,6 +392,7 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
             setMode('list');
           }}
           onEdit={() => openEditById(activeQuote.id)}
+          onDelete={() => handleArchive(activeQuote)}
           extraActions={
             <>
               <select
@@ -888,12 +894,17 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
-                            downloadAuthenticatedFile(
-                              `/api/quotations/${q.id}/pdf`,
-                              `${q.quotation_number}.pdf`
-                            )
-                          }
+                          onClick={async () => {
+                            setError('');
+                            try {
+                              await downloadAuthenticatedFile(
+                                `/api/quotations/${q.id}/pdf`,
+                                `${q.quotation_number}.pdf`
+                              );
+                            } catch (err: any) {
+                              setError(err.message || 'Failed to download Quotation PDF.');
+                            }
+                          }}
                           title="Download PDF"
                           className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded"
                         >

@@ -1,3 +1,23 @@
+const RAW_API_BASE = (
+  (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || ''
+)
+  .trim()
+  .replace(/\/+$/, '');
+
+export function resolveApiUrl(url: string): string {
+  if (!url) return url;
+  if (/^https?:\/\//i.test(url)) return url;
+  if (!RAW_API_BASE) return url;
+  return `${RAW_API_BASE}${url.startsWith('/') ? url : `/${url}`}`;
+}
+
+export function resolveAssetUrl(url: string | null | undefined): string {
+  if (!url) return '';
+  if (/^(https?:|data:|blob:)/i.test(url)) return url;
+  if (!RAW_API_BASE) return url;
+  return `${RAW_API_BASE}${url.startsWith('/') ? url : `/${url}`}`;
+}
+
 export function generateIdempotencyKey(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -20,20 +40,33 @@ export async function apiFetch<T = any>(
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(url, {
-    ...options,
-    headers,
-  });
+  let res: Response;
+  try {
+    res = await fetch(resolveApiUrl(url), {
+      ...options,
+      headers,
+    });
+  } catch (_) {
+    throw new Error(
+      'Unable to connect to the backend server. Please verify your network or server connection and try again.'
+    );
+  }
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
 
   if (!res.ok) {
-    let errMsg = `Request failed (${res.status})`;
+    let errMsg = `Request failed (HTTP ${res.status})`;
     let extra: Record<string, any> = {};
-    try {
-      const data = await res.json();
-      if (data?.error) errMsg = data.error;
-      extra = data;
-    } catch (_) {
-      // ignore json parse error
+    if (contentType.includes('application/json')) {
+      try {
+        const data = await res.json();
+        if (data?.error) errMsg = data.error;
+        extra = data;
+      } catch (_) {
+        // ignore json parse error
+      }
+    } else if (res.status === 404) {
+      errMsg = `API endpoint not found (${url}).`;
     }
     const err = new Error(errMsg) as Error & { status?: number; data?: any };
     err.status = res.status;
@@ -41,19 +74,82 @@ export async function apiFetch<T = any>(
     throw err;
   }
 
+  if (!contentType.includes('application/json')) {
+    throw new Error(
+      'Backend API returned a non-JSON response. Please check that serverless API routing is active.'
+    );
+  }
+
   return res.json();
 }
 
+async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
+  const lowerName = (file.name || '').toLowerCase();
+  const isNativePdfImage =
+    ['image/png', 'image/jpeg', 'image/jpg'].includes(file.type.toLowerCase()) &&
+    /\.(png|jpe?g)$/.test(lowerName);
+
+  if (isNativePdfImage || typeof document === 'undefined') {
+    return file;
+  }
+
+  // Convert WEBP / SVG / GIF to lossless PNG so PDFKit embeds logos & photos reliably
+  return new Promise((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w = Math.max(1, img.naturalWidth || img.width || 600);
+        const h = Math.max(1, img.naturalHeight || img.height || 600);
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          URL.revokeObjectURL(objectUrl);
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => {
+            URL.revokeObjectURL(objectUrl);
+            if (!blob) {
+              resolve(file);
+              return;
+            }
+            const base = (file.name || 'upload').replace(/\.[^.]+$/, '');
+            resolve(new File([blob], `${base}.png`, { type: 'image/png' }));
+          },
+          'image/png',
+          1.0
+        );
+      } catch (_) {
+        URL.revokeObjectURL(objectUrl);
+        resolve(file);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      resolve(file);
+    };
+    img.src = objectUrl;
+  });
+}
+
 export async function uploadImageFile(file: File): Promise<{ url: string; filename: string }> {
+  const normalizedFile = await normalizeImageForPdfCompatibility(file);
   const formData = new FormData();
-  formData.append('file', file);
+  formData.append('file', normalizedFile);
   return apiFetch('/api/uploads', {
     method: 'POST',
     body: formData,
   });
 }
 
-export async function uploadSignatureDataUrl(dataUrl: string): Promise<{ url: string; filename: string }> {
+export async function uploadSignatureDataUrl(
+  dataUrl: string
+): Promise<{ url: string; filename: string }> {
   return apiFetch('/api/uploads/data-url', {
     method: 'POST',
     body: JSON.stringify({ data_url: dataUrl }),
@@ -61,16 +157,30 @@ export async function uploadSignatureDataUrl(dataUrl: string): Promise<{ url: st
 }
 
 export async function downloadAuthenticatedFile(url: string, fallbackFilename: string) {
-  const res = await fetch(url);
+  let res: Response;
+  try {
+    res = await fetch(resolveApiUrl(url));
+  } catch (_) {
+    throw new Error('Unable to reach server to download file.');
+  }
+
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
   if (!res.ok) {
-    let msg = 'Failed to download file.';
-    try {
-      const d = await res.json();
-      if (d?.error) msg = d.error;
-    } catch (_) {
-      // ignore
+    let msg = `Failed to download file (HTTP ${res.status}).`;
+    if (contentType.includes('application/json')) {
+      try {
+        const d = await res.json();
+        if (d?.error) msg = d.error;
+      } catch (_) {
+        // ignore
+      }
     }
     throw new Error(msg);
+  }
+
+  if (contentType.includes('text/html')) {
+    throw new Error('Download failed: server returned HTML instead of a document file.');
   }
 
   const blob = await res.blob();

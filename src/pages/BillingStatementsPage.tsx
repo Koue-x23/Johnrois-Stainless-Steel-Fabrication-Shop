@@ -93,6 +93,7 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
 
   const fetchStatements = () => {
     setLoading(true);
+    setError('');
     const params = new URLSearchParams();
     if (search.trim()) params.set('search', search.trim());
     if (dateFrom) params.set('date_from', dateFrom);
@@ -102,7 +103,9 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
       `/api/billing-statements?${params.toString()}`
     )
       .then((res) => setStatements(res.billing_statements || []))
-      .catch(() => {})
+      .catch((err: any) => {
+        setError(err.message || 'Failed to load billing statements.');
+      })
       .finally(() => setLoading(false));
   };
 
@@ -110,7 +113,9 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
     fetchStatements();
     apiFetch<{ customers: Customer[] }>('/api/customers?status=active')
       .then((r) => setCustomers(r.customers || []))
-      .catch(() => {});
+      .catch((err: any) => {
+        setError(err.message || 'Failed to load customers for billing statement.');
+      });
   }, [dateFrom, dateTo]);
 
   useEffect(() => {
@@ -144,7 +149,9 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
       .then((res) => {
         setLedgerPreview(res.ledger);
       })
-      .catch(() => {})
+      .catch((err: any) => {
+        setError(err.message || 'Failed to compute statement ledger preview.');
+      })
       .finally(() => setPreviewLoading(false));
   }, [mode, selectedCustomerId, periodFrom, periodTo]);
 
@@ -342,34 +349,43 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
   };
 
   const handleArchive = async (st: BillingStatement) => {
-    if (!window.confirm(`Archive billing statement ${st.statement_number}?`)) return;
+    if (!window.confirm(`Delete billing statement ${st.statement_number}?`)) return;
+    setError('');
     try {
       await apiFetch(`/api/billing-statements/${st.id}`, { method: 'DELETE' });
       fetchStatements();
       if (mode === 'preview') setMode('list');
     } catch (err: any) {
-      setError(err.message || 'Failed to archive statement.');
+      setError(err.message || 'Failed to delete statement.');
     }
   };
 
   if (mode === 'preview' && activeStatement) {
     return (
-      <PrintableDocument
-        doc={{ type: 'billing_statement', data: activeStatement }}
-        settings={settings}
-        onBack={() => setMode('list')}
-        onEdit={() => openEditById(activeStatement.id)}
-        extraActions={
-          <button
-            type="button"
-            onClick={handleRecalculateActive}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            Sync Latest Invoices & Payments
-          </button>
-        }
-      />
+      <div className="space-y-3">
+        {error && (
+          <div className="no-print p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700">
+            {error}
+          </div>
+        )}
+        <PrintableDocument
+          doc={{ type: 'billing_statement', data: activeStatement }}
+          settings={settings}
+          onBack={() => setMode('list')}
+          onEdit={() => openEditById(activeStatement.id)}
+          onDelete={() => handleArchive(activeStatement)}
+          extraActions={
+            <button
+              type="button"
+              onClick={handleRecalculateActive}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Sync Latest Invoices & Payments
+            </button>
+          }
+        />
+      </div>
     );
   }
 
@@ -683,6 +699,12 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
 
   return (
     <div className="space-y-5">
+      {error && (
+        <div className="p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700">
+          {error}
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-200">
         <div>
           <h1 className="text-xl font-bold text-slate-900 tracking-tight">Billing Statements</h1>
@@ -821,12 +843,17 @@ export const BillingStatementsPage: React.FC<BillingStatementsPageProps> = ({
                         </button>
                         <button
                           type="button"
-                          onClick={() =>
-                            downloadAuthenticatedFile(
-                              `/api/billing-statements/${st.id}/pdf`,
-                              `${st.statement_number}.pdf`
-                            )
-                          }
+                          onClick={async () => {
+                            setError('');
+                            try {
+                              await downloadAuthenticatedFile(
+                                `/api/billing-statements/${st.id}/pdf`,
+                                `${st.statement_number}.pdf`
+                              );
+                            } catch (err: any) {
+                              setError(err.message || 'Failed to download Billing Statement PDF.');
+                            }
+                          }}
                           title="Download PDF"
                           className="p-1.5 text-slate-600 hover:text-slate-900 hover:bg-slate-100 rounded"
                         >
