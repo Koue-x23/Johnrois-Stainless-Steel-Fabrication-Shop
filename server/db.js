@@ -8,15 +8,115 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT_DIR = path.resolve(__dirname, '..');
 
 const IS_VERCEL = Boolean(process.env.VERCEL);
-const TURSO_URL = (process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL || '').trim();
-const TURSO_TOKEN = (process.env.TURSO_AUTH_TOKEN || process.env.LIBSQL_AUTH_TOKEN || '').trim();
-const POSTGRES_URL = (
-  process.env.DATABASE_URL ||
-  process.env.POSTGRES_URL ||
-  process.env.POSTGRES_PRISMA_URL ||
-  ''
-).trim();
 const CUSTOM_SQLITE_PATH = (process.env.SQLITE_DB_PATH || '').trim();
+
+const EXPLICIT_POSTGRES_ENV_KEYS = [
+  'DATABASE_URL',
+  'POSTGRES_URL',
+  'NEON_DATABASE_URL',
+  'NEON_POSTGRES_URL',
+  'POSTGRES_PRISMA_URL',
+  'DATABASE_URL_UNPOOLED',
+  'POSTGRES_URL_NON_POOLING',
+];
+
+export function resolvePostgresConnection(env = process.env) {
+  for (const key of EXPLICIT_POSTGRES_ENV_KEYS) {
+    const val = (env[key] || '').trim();
+    if (/^postgres(ql)?:\/\//i.test(val)) {
+      return {
+        connectionString: val,
+        envSource: key,
+        isNeon: /\.neon\.tech\b/i.test(val),
+      };
+    }
+  }
+
+  // Support custom-prefixed Vercel Marketplace Neon / Postgres variables (e.g. STORAGE_DATABASE_URL, JOHNROIS_DATABASE_URL)
+  for (const [key, rawVal] of Object.entries(env)) {
+    if (
+      /(?:^|_)(?:DATABASE_URL|POSTGRES_URL|POSTGRES_PRISMA_URL|DATABASE_URL_UNPOOLED|POSTGRES_URL_NON_POOLING)$/i.test(
+        key
+      )
+    ) {
+      const val = String(rawVal || '').trim();
+      if (/^postgres(ql)?:\/\//i.test(val)) {
+        return {
+          connectionString: val,
+          envSource: key,
+          isNeon: /\.neon\.tech\b/i.test(val),
+        };
+      }
+    }
+  }
+
+  // Support discrete PGHOST / POSTGRES_HOST variables if URL is not provided directly
+  const host = (env.PGHOST || env.POSTGRES_HOST || '').trim();
+  const user = (env.PGUSER || env.POSTGRES_USER || '').trim();
+  const password = env.PGPASSWORD || env.POSTGRES_PASSWORD || '';
+  const database = (env.PGDATABASE || env.POSTGRES_DATABASE || '').trim();
+  const port = (env.PGPORT || env.POSTGRES_PORT || '5432').trim();
+  if (host && user && database) {
+    const sslMode = /^(localhost|127\.0\.0\.1|::1)$/i.test(host) ? 'disable' : 'require';
+    const built = `postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}?sslmode=${sslMode}`;
+    return {
+      connectionString: built,
+      envSource: env.PGHOST ? 'PGHOST' : 'POSTGRES_HOST',
+      isNeon: /\.neon\.tech\b/i.test(host),
+    };
+  }
+
+  return null;
+}
+
+export function buildPgPoolConfig(rawConnectionString, env = process.env) {
+  let cleanUrl = rawConnectionString.trim();
+  let needsSsl =
+    !/localhost|127\.0\.0\.1|::1/i.test(cleanUrl) && !/sslmode=disable/i.test(cleanUrl);
+
+  try {
+    const parsed = new URL(cleanUrl);
+    const sslMode = (parsed.searchParams.get('sslmode') || env.PGSSLMODE || '').toLowerCase();
+    const isLocalHost = /^(localhost|127\.0\.0\.1|::1)$/i.test(parsed.hostname);
+
+    if (sslMode === 'disable' || sslMode === 'allow') {
+      needsSsl = false;
+    } else if (sslMode) {
+      needsSsl = true;
+    } else {
+      needsSsl = !isLocalHost;
+    }
+
+    // Strip sslmode / ssl / channel_binding query parameters from connectionString so
+    // pg-connection-string inside new pg.Client(pool.options) does NOT overwrite `ssl`
+    // or emit deprecation warnings on serverless cold starts.
+    parsed.searchParams.delete('sslmode');
+    parsed.searchParams.delete('ssl');
+    parsed.searchParams.delete('uselibpqcompat');
+    parsed.searchParams.delete('channel_binding');
+    cleanUrl = parsed.toString();
+  } catch (_) {
+    // Fallback to raw URL if URL constructor cannot parse non-standard DSN
+  }
+
+  const maxConnections = env.PG_POOL_MAX
+    ? Math.max(1, Number(env.PG_POOL_MAX) || 3)
+    : env.VERCEL
+      ? 3
+      : 10;
+
+  return {
+    connectionString: cleanUrl,
+    ssl: needsSsl ? { rejectUnauthorized: false } : false,
+    // Enable SCRAM-SHA-256-PLUS channel binding when offered by Neon over TLS
+    enableChannelBinding: Boolean(needsSsl),
+    max: maxConnections,
+    idleTimeoutMillis: env.VERCEL ? 10000 : 30000,
+    connectionTimeoutMillis: 15000,
+    allowExitOnIdle: true,
+    keepAlive: true,
+  };
+}
 
 function resolveWritableDir(preferredDir, fallbackSubdir) {
   try {
@@ -467,6 +567,47 @@ function toPostgresDdl(sqliteStmt) {
 // ADAPTER INITIALIZERS
 // ============================================================================
 
+const POSTGRES_COLUMN_MIGRATIONS = [
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS signature_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS other_social_links TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS operating_hours TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS authorized_representative TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS authorized_title TEXT NOT NULL DEFAULT 'Authorized Representative'",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_enabled INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_label TEXT NOT NULL DEFAULT 'VAT'",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
+  "ALTER TABLE customers ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE products_services ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS converted_invoice_id INTEGER DEFAULT NULL",
+  "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS technician_signature_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS customer_signature_url TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE billing_statements ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+];
+
+function isTransientPostgresError(err) {
+  if (!err) return false;
+  const code = String(err.code || '');
+  if (['57P01', '57P02', '57P03', '08000', '08003', '08006', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(code)) {
+    return true;
+  }
+  const msg = String(err.message || '');
+  return /Connection terminated unexpectedly|Client has encountered a connection error|server closed the connection unexpectedly|terminating connection due to administrator command/i.test(
+    msg
+  );
+}
+
+function normalizePostgresParams(params = []) {
+  return params.map((p) => {
+    if (typeof p === 'boolean') return p ? 1 : 0;
+    if (p === undefined) return null;
+    return p;
+  });
+}
+
 async function createPostgresAdapter(connectionString) {
   const pgMod = await import('pg');
   const pg = pgMod.default || pgMod;
@@ -474,38 +615,79 @@ async function createPostgresAdapter(connectionString) {
   pg.types.setTypeParser(20, (val) => (val === null ? null : Number(val)));
   pg.types.setTypeParser(1700, (val) => (val === null ? null : Number(val)));
 
-  const needsSsl =
-    !/localhost|127\.0\.0\.1/.test(connectionString) &&
-    !/sslmode=disable/i.test(connectionString);
+  const poolConfig = buildPgPoolConfig(connectionString);
+  const pool = new pg.Pool(poolConfig);
 
-  const pool = new pg.Pool({
-    connectionString,
-    ssl: needsSsl ? { rejectUnauthorized: false } : undefined,
-    max: 10,
+  // Prevent Neon scale-to-zero / idle PgBouncer disconnects from crashing the serverless process
+  pool.on('error', (err) => {
+    console.warn('[db:postgres] Idle pooled connection closed:', err?.message || err);
   });
 
   const getExecutor = () => txContext.getStore() || pool;
 
+  const queryWithRetry = async (pgSql, rawParams = []) => {
+    const cleanParams = normalizePostgresParams(rawParams);
+    const activeTx = txContext.getStore();
+    if (activeTx) {
+      return activeTx.query(pgSql, cleanParams);
+    }
+    try {
+      return await pool.query(pgSql, cleanParams);
+    } catch (err) {
+      if (isTransientPostgresError(err)) {
+        return pool.query(pgSql, cleanParams);
+      }
+      throw err;
+    }
+  };
+
   return {
     type: 'postgres',
+    pool,
     async initSchema() {
-      for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
-        await pool.query(toPostgresDdl(stmt));
+      let client;
+      try {
+        client = await pool.connect();
+      } catch (err) {
+        if (isTransientPostgresError(err)) {
+          client = await pool.connect();
+        } else {
+          throw err;
+        }
+      }
+      let locked = false;
+      try {
+        // Serialize concurrent Vercel cold-start schema migrations against Neon
+        await client.query('SELECT pg_advisory_lock(84729104)');
+        locked = true;
+        for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
+          await client.query(toPostgresDdl(stmt));
+        }
+        for (const alterStmt of POSTGRES_COLUMN_MIGRATIONS) {
+          await client.query(alterStmt);
+        }
+      } finally {
+        if (locked) {
+          try {
+            await client.query('SELECT pg_advisory_unlock(84729104)');
+          } catch (_) {}
+        }
+        client.release();
       }
     },
     async get(sql, params = []) {
       const pgSql = translateSqlForPostgres(sql, false);
-      const res = await getExecutor().query(pgSql, params);
+      const res = await queryWithRetry(pgSql, params);
       return res.rows[0] || undefined;
     },
     async all(sql, params = []) {
       const pgSql = translateSqlForPostgres(sql, false);
-      const res = await getExecutor().query(pgSql, params);
+      const res = await queryWithRetry(pgSql, params);
       return res.rows;
     },
     async run(sql, params = []) {
       const pgSql = translateSqlForPostgres(sql, true);
-      const res = await getExecutor().query(pgSql, params);
+      const res = await queryWithRetry(pgSql, params);
       return {
         changes: res.rowCount || 0,
         lastInsertRowid: res.rows?.[0]?.id ?? null,
@@ -515,7 +697,16 @@ async function createPostgresAdapter(connectionString) {
       if (txContext.getStore()) {
         return fn();
       }
-      const client = await pool.connect();
+      let client;
+      try {
+        client = await pool.connect();
+      } catch (err) {
+        if (isTransientPostgresError(err)) {
+          client = await pool.connect();
+        } else {
+          throw err;
+        }
+      }
       try {
         await client.query('BEGIN');
         const result = await txContext.run(client, fn);
@@ -532,7 +723,7 @@ async function createPostgresAdapter(connectionString) {
     },
     async syncSequencesAfterRestore() {
       for (const tbl of SERIAL_ID_TABLES) {
-        await pool.query(
+        await queryWithRetry(
           `SELECT setval(pg_get_serial_sequence('${tbl}', 'id'), COALESCE((SELECT MAX(id) FROM ${tbl}), 1), (SELECT MAX(id) IS NOT NULL FROM ${tbl}))`
         );
       }
@@ -670,74 +861,94 @@ export async function ensureDbReady() {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
-    if (POSTGRES_URL) {
-      adapter = await createPostgresAdapter(POSTGRES_URL);
-      storageStatus = {
+    const pgConfig = resolvePostgresConnection(process.env);
+    const tursoUrl = (process.env.TURSO_DATABASE_URL || process.env.LIBSQL_URL || '').trim();
+    const tursoToken = (process.env.TURSO_AUTH_TOKEN || process.env.LIBSQL_AUTH_TOKEN || '').trim();
+    const customSqlitePath = (process.env.SQLITE_DB_PATH || '').trim();
+    const isVercelRuntime = Boolean(process.env.VERCEL);
+
+    let candidateAdapter;
+    let nextStatus;
+
+    if (pgConfig) {
+      candidateAdapter = await createPostgresAdapter(pgConfig.connectionString);
+      nextStatus = {
         engine: 'postgres',
+        provider: pgConfig.isNeon ? 'neon' : 'postgres',
+        env_source: pgConfig.envSource,
         persistent: true,
-        is_serverless: IS_VERCEL,
+        is_serverless: isVercelRuntime,
         setup_required: false,
-        message: 'Connected to persistent PostgreSQL database.',
+        message: pgConfig.isNeon
+          ? `Connected to persistent Neon PostgreSQL database (${pgConfig.envSource}).`
+          : `Connected to persistent PostgreSQL database (${pgConfig.envSource}).`,
       };
-    } else if (TURSO_URL) {
-      adapter = await createLibsqlAdapter(TURSO_URL, TURSO_TOKEN);
-      storageStatus = {
+    } else if (tursoUrl) {
+      candidateAdapter = await createLibsqlAdapter(tursoUrl, tursoToken);
+      nextStatus = {
         engine: 'turso',
+        provider: 'turso',
+        env_source: process.env.TURSO_DATABASE_URL ? 'TURSO_DATABASE_URL' : 'LIBSQL_URL',
         persistent: true,
-        is_serverless: IS_VERCEL,
+        is_serverless: isVercelRuntime,
         setup_required: false,
         message: 'Connected to persistent Turso / LibSQL cloud database.',
       };
-    } else if (IS_VERCEL && !CUSTOM_SQLITE_PATH) {
+    } else if (isVercelRuntime && !customSqlitePath) {
       const ephemeralPath = path.join(os.tmpdir(), 'johnrois-ephemeral.sqlite');
-      adapter = await createNodeSqliteAdapter(ephemeralPath);
-      storageStatus = {
+      candidateAdapter = await createNodeSqliteAdapter(ephemeralPath);
+      nextStatus = {
         engine: 'sqlite-ephemeral',
+        provider: 'ephemeral',
+        env_source: null,
         persistent: false,
         is_serverless: true,
         setup_required: true,
         message:
-          'Persistent database is not configured on Vercel yet. Connect Neon / Vercel Postgres (DATABASE_URL) or Turso (TURSO_DATABASE_URL + TURSO_AUTH_TOKEN) in Vercel Project Settings → Storage / Environment Variables so saved records and uploads persist permanently across cold starts and redeployments.',
+          'Persistent database is not configured on Vercel yet. Connect Neon / Vercel Postgres (DATABASE_URL / POSTGRES_URL) or Turso (TURSO_DATABASE_URL + TURSO_AUTH_TOKEN) in Vercel Project Settings → Storage / Environment Variables and redeploy so saved records and uploads persist permanently.',
       };
     } else {
-      adapter = await createNodeSqliteAdapter(DB_PATH);
-      storageStatus = {
+      const targetSqlitePath = customSqlitePath || DB_PATH;
+      candidateAdapter = await createNodeSqliteAdapter(targetSqlitePath);
+      nextStatus = {
         engine: 'sqlite',
-        persistent: dataDirInfo.writable || Boolean(CUSTOM_SQLITE_PATH),
+        provider: 'sqlite',
+        env_source: customSqlitePath ? 'SQLITE_DB_PATH' : 'local',
+        persistent: dataDirInfo.writable || Boolean(customSqlitePath),
         is_serverless: false,
         setup_required: false,
-        message: `Connected to persistent SQLite database (${DB_PATH}).`,
+        message: `Connected to persistent SQLite database (${targetSqlitePath}).`,
       };
     }
 
-    await adapter.initSchema();
+    await candidateAdapter.initSchema();
 
-    // Ensure singleton business_settings row exists using ONLY verified public details & editable blank fields
-    const existingSettings = await adapter.get('SELECT id FROM business_settings WHERE id = 1');
-    if (!existingSettings) {
-      await adapter.run(
-        `INSERT INTO business_settings (
-          id, business_name, logo_url, address, contact_number, email,
-          facebook_url, maps_url, other_social_links, operating_hours,
-          default_payment_terms, updated_at
-        ) VALUES (
-          1,
-          'Johnrois Stainless Steel Fabrication Shop',
-          '',
-          'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
-          '+63 917 421 7417',
-          '',
-          'https://www.facebook.com/johnroiscanon',
-          'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
-          '',
-          'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
-          '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
-          ?
-        )`,
-        [nowISO()]
-      );
-    }
+    // Concurrency-safe singleton business_settings seed using ONLY verified public details & editable blank fields
+    await candidateAdapter.run(
+      `INSERT INTO business_settings (
+        id, business_name, logo_url, address, contact_number, email,
+        facebook_url, maps_url, other_social_links, operating_hours,
+        default_payment_terms, updated_at
+      ) VALUES (
+        1,
+        'Johnrois Stainless Steel Fabrication Shop',
+        '',
+        'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
+        '+63 917 421 7417',
+        '',
+        'https://www.facebook.com/johnroiscanon',
+        'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
+        '',
+        'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
+        '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+        ?
+      )
+      ON CONFLICT (id) DO NOTHING`,
+      [nowISO()]
+    );
 
+    adapter = candidateAdapter;
+    storageStatus = nextStatus;
     return adapter;
   })();
 
@@ -745,6 +956,13 @@ export async function ensureDbReady() {
     return await initPromise;
   } catch (err) {
     initPromise = null;
+    storageStatus = {
+      engine: 'error',
+      persistent: false,
+      is_serverless: Boolean(process.env.VERCEL),
+      setup_required: false,
+      message: `Database connection error: ${err?.message || 'Unable to connect to database'}`,
+    };
     throw err;
   }
 }
@@ -812,7 +1030,7 @@ export async function saveUploadedFile({ filename, mimeType, buffer }) {
   }
 
   return {
-    url: `/uploads/${safeName}`,
+    url: `/api/uploads/files/${safeName}`,
     filename: safeName,
     mime_type: resolvedMime,
   };
@@ -931,21 +1149,14 @@ export async function allocateNextDocNumber(type, dateStr = todayYMD()) {
   let attempts = 0;
   while (attempts < 1000) {
     attempts++;
-    const existing = await dbGet('SELECT last_val FROM document_sequences WHERE seq_key = ?', [
-      seqKey,
-    ]);
-    const nextVal = (existing ? Number(existing.last_val) : 0) + 1;
-    if (existing) {
-      await dbRun('UPDATE document_sequences SET last_val = ? WHERE seq_key = ?', [
-        nextVal,
-        seqKey,
-      ]);
-    } else {
-      await dbRun('INSERT INTO document_sequences (seq_key, last_val) VALUES (?, ?)', [
-        seqKey,
-        nextVal,
-      ]);
-    }
+    const seqRow = await dbGet(
+      `INSERT INTO document_sequences (seq_key, last_val)
+       VALUES (?, 1)
+       ON CONFLICT (seq_key) DO UPDATE SET last_val = document_sequences.last_val + 1
+       RETURNING last_val`,
+      [seqKey]
+    );
+    const nextVal = Number(seqRow?.last_val || 1);
     const candidate = formatDocNumber(settings, type, nextVal, yearStr);
     const collision = await dbGet(`SELECT id FROM ${table} WHERE ${col} = ?`, [candidate]);
     if (!collision) return candidate;

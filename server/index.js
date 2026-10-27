@@ -1,10 +1,13 @@
 import express from 'express';
 import compression from 'compression';
 import multer from 'multer';
+import busboyMod from 'busboy';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+const createBusboy = busboyMod.default || busboyMod;
 import {
   ensureDbReady,
   getStorageStatus,
@@ -40,6 +43,67 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.disable('x-powered-by');
 app.use(compression());
+
+function drainRestoredRequestBuffer(req) {
+  if (Buffer.isBuffer(req.rawBody)) return req.rawBody;
+  if (typeof req.read !== 'function') return null;
+  const chunks = [];
+  let chunk;
+  while ((chunk = req.read()) !== null) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return chunks.length > 0 ? Buffer.concat(chunks) : null;
+}
+
+// Recover request payloads when @vercel/node helpers pre-consume the IncomingMessage stream
+app.use((req, _res, next) => {
+  const ct = String(req.headers['content-type'] || '').toLowerCase();
+  const bodyDesc = Object.getOwnPropertyDescriptor(req, 'body');
+  const hasPrebufferedStream = !req.readable || Boolean(bodyDesc?.get) || bodyDesc?.value !== undefined;
+
+  if (!hasPrebufferedStream) {
+    return next();
+  }
+
+  try {
+    if (ct.includes('application/json')) {
+      if (bodyDesc?.get) {
+        const parsed = req.body;
+        req.body = parsed && typeof parsed === 'object' ? parsed : {};
+        req._body = true;
+      } else if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+        req._body = true;
+      } else {
+        const raw = Buffer.isBuffer(req.body) ? req.body : drainRestoredRequestBuffer(req);
+        const text = raw ? raw.toString('utf8').trim() : '';
+        req.body = text ? JSON.parse(text) : {};
+        req._body = true;
+      }
+    } else if (ct.includes('application/x-www-form-urlencoded')) {
+      if (bodyDesc?.get) {
+        req.body = req.body || {};
+        req._body = true;
+      } else if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+        req._body = true;
+      } else {
+        const raw = Buffer.isBuffer(req.body) ? req.body : drainRestoredRequestBuffer(req);
+        const params = new URLSearchParams(raw ? raw.toString('utf8') : '');
+        req.body = Object.fromEntries(params.entries());
+        req._body = true;
+      }
+    } else if (ct.includes('multipart/form-data') && !req.readable) {
+      const raw = Buffer.isBuffer(req.body) ? req.body : drainRestoredRequestBuffer(req);
+      if (raw && raw.length > 0) {
+        req._recoveredRawBody = raw;
+      }
+    }
+  } catch (err) {
+    return next(err);
+  }
+
+  return next();
+});
+
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
@@ -72,20 +136,20 @@ const upload = multer({
 });
 
 // Serve uploaded images/logos/signatures from persistent DB storage (with local disk fallback)
-app.get(
-  '/uploads/:filename',
-  asyncHandler(async (req, res) => {
-    await ensureDbReady();
-    const fileObj = await getUploadedFile(req.params.filename);
-    if (!fileObj) {
-      return res.status(404).json({ error: 'Uploaded file not found.' });
-    }
-    res.setHeader('Content-Type', fileObj.mime_type || 'application/octet-stream');
-    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(fileObj.buffer);
-  })
-);
+const serveUploadedAsset = asyncHandler(async (req, res) => {
+  await ensureDbReady();
+  const fileObj = await getUploadedFile(req.params.filename);
+  if (!fileObj) {
+    return res.status(404).json({ error: 'Uploaded file not found.' });
+  }
+  res.setHeader('Content-Type', fileObj.mime_type || 'application/octet-stream');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(fileObj.buffer);
+});
+
+app.get('/api/uploads/files/:filename', serveUploadedAsset);
+app.get('/uploads/:filename', serveUploadedAsset);
 
 // Health & storage readiness endpoint
 app.get(
@@ -238,9 +302,62 @@ function computeTotalsFromItems(rawItems, discountType, discountValue, taxEnable
 // UPLOADS (LOGOS, SIGNATURES, SERVICE PHOTOS)
 // ============================================================================
 
+function parseMultipartUpload(req, res, next) {
+  if (!req._recoveredRawBody) {
+    return upload.single('file')(req, res, next);
+  }
+
+  try {
+    const bb = createBusboy({
+      headers: req.headers,
+      limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+    });
+    let fileFound = false;
+    let fileTooLarge = false;
+    let origName = 'upload.png';
+    let mimeType = 'image/png';
+    const fileChunks = [];
+
+    bb.on('file', (fieldname, stream, info) => {
+      if (fieldname !== 'file') {
+        stream.resume();
+        return;
+      }
+      fileFound = true;
+      origName = info?.filename || 'upload.png';
+      mimeType = info?.mimeType || 'image/png';
+      stream.on('data', (d) => fileChunks.push(d));
+      stream.on('limit', () => {
+        fileTooLarge = true;
+      });
+    });
+
+    bb.on('error', (err) => next(err));
+
+    bb.on('finish', () => {
+      if (fileTooLarge) {
+        return res.status(413).json({ error: 'Uploaded image exceeds the 10 MB size limit.' });
+      }
+      if (fileFound && fileChunks.length > 0) {
+        req.file = {
+          fieldname: 'file',
+          originalname: origName,
+          mimetype: mimeType,
+          buffer: Buffer.concat(fileChunks),
+        };
+      }
+      return next();
+    });
+
+    bb.end(req._recoveredRawBody);
+  } catch (err) {
+    return next(err);
+  }
+}
+
 app.post(
   '/api/uploads',
-  upload.single('file'),
+  parseMultipartUpload,
   asyncHandler(async (req, res) => {
     if (!req.file || !req.file.buffer) {
       return res.status(400).json({ error: 'No image file provided.' });
@@ -262,18 +379,24 @@ app.post(
 app.post(
   '/api/uploads/data-url',
   asyncHandler(async (req, res) => {
-    const { data_url } = req.body || {};
+    const { data_url, filename: rawFilename } = req.body || {};
     if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
       return res.status(400).json({ error: 'Valid image data URL is required.' });
     }
-    const match = data_url.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/);
+    const match = data_url.match(/^data:image\/(png|jpeg|jpg|webp|gif|svg\+xml);base64,(.+)$/i);
     if (!match) {
       return res.status(400).json({ error: 'Unsupported image format.' });
     }
-    const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
-    const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+    const rawSub = match[1].toLowerCase();
+    const ext = rawSub === 'jpeg' ? 'jpg' : rawSub === 'svg+xml' ? 'svg' : rawSub;
+    const mimeType =
+      ext === 'jpg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : `image/${ext}`;
     const buffer = Buffer.from(match[2], 'base64');
-    const filename = `sig-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${ext}`;
+    if (buffer.length > 10 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Uploaded image exceeds the 10 MB size limit.' });
+    }
+    const prefix = rawFilename ? 'img' : 'sig';
+    const filename = `${prefix}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${ext}`;
     const saved = await saveUploadedFile({ filename, mimeType, buffer });
     res.json({ url: saved.url, filename: saved.filename });
   })
@@ -371,7 +494,7 @@ app.put(
       actor_name: req.user.full_name,
     });
 
-    res.json({ settings: await getSettings() });
+    res.json({ settings: await getSettings(), storage: getStorageStatus() });
   })
 );
 
