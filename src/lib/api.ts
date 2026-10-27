@@ -1,14 +1,3 @@
-const TOKEN_KEY = 'johnrois_auth_token';
-
-export function getStoredToken(): string {
-  return localStorage.getItem(TOKEN_KEY) || '';
-}
-
-export function setStoredToken(token: string) {
-  if (token) localStorage.setItem(TOKEN_KEY, token);
-  else localStorage.removeItem(TOKEN_KEY);
-}
-
 export function generateIdempotencyKey(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -24,10 +13,6 @@ export async function apiFetch<T = any>(
     ...(options.headers as Record<string, string>),
   };
 
-  const token = getStoredToken();
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
   if (options.idempotencyKey) {
     headers['X-Idempotency-Key'] = options.idempotencyKey;
   }
@@ -38,7 +23,6 @@ export async function apiFetch<T = any>(
   const res = await fetch(url, {
     ...options,
     headers,
-    credentials: 'include',
   });
 
   if (!res.ok) {
@@ -77,11 +61,7 @@ export async function uploadSignatureDataUrl(dataUrl: string): Promise<{ url: st
 }
 
 export async function downloadAuthenticatedFile(url: string, fallbackFilename: string) {
-  const token = getStoredToken();
-  const headers: Record<string, string> = {};
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-
-  const res = await fetch(url, { headers, credentials: 'include' });
+  const res = await fetch(url);
   if (!res.ok) {
     let msg = 'Failed to download file.';
     try {

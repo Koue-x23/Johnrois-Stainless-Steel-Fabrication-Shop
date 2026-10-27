@@ -32,21 +32,6 @@ export function todayYMD() {
   return new Date().toISOString().slice(0, 10);
 }
 
-export function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
-  return `${salt}:${hash}`;
-}
-
-export function verifyPassword(password, stored) {
-  if (!stored || !stored.includes(':')) return false;
-  const [salt, key] = stored.split(':');
-  const hashBuffer = crypto.scryptSync(password, salt, 64);
-  const keyBuffer = Buffer.from(key, 'hex');
-  if (hashBuffer.length !== keyBuffer.length) return false;
-  return crypto.timingSafeEqual(hashBuffer, keyBuffer);
-}
-
 export function initDatabase() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -399,16 +384,6 @@ export function initDatabase() {
         ?
       )
     `).run(nowISO());
-  }
-
-  // Bootstrap initial Owner account if no users exist yet (zero fake business transactions!)
-  const userCount = db.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
-  if (userCount === 0) {
-    const now = nowISO();
-    db.prepare(`
-      INSERT INTO users (username, full_name, email, password_hash, role, is_active, is_initial_setup, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'owner', 1, 1, ?, ?)
-    `).run('admin', 'Shop Owner / Administrator', '', hashPassword('Johnrois@2026'), now, now);
   }
 }
 

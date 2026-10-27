@@ -5,13 +5,10 @@ import {
   PenTool,
   Download,
   Database,
-  Users,
-  Lock,
   Info,
   CheckCircle2,
-  Plus,
 } from 'lucide-react';
-import { AuthUser, BusinessSettings, UserRole } from '../types';
+import { BusinessSettings } from '../types';
 import {
   apiFetch,
   downloadAuthenticatedFile,
@@ -21,18 +18,15 @@ import {
 import { SignaturePadModal } from '../components/SignaturePadModal';
 
 interface SettingsPageProps {
-  user: AuthUser;
   settings: BusinessSettings;
   onSettingsUpdated: (s: BusinessSettings) => void;
 }
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({
-  user,
   settings,
   onSettingsUpdated,
 }) => {
-  const isOwner = user.role === 'owner';
-  const [tab, setTab] = useState<'business' | 'users' | 'security' | 'backup'>('business');
+  const [tab, setTab] = useState<'business' | 'backup'>('business');
 
   const [form, setForm] = useState<BusinessSettings>(settings);
   const [saving, setSaving] = useState(false);
@@ -41,34 +35,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
   const [notice, setNotice] = useState('');
   const [error, setError] = useState('');
 
-  // Staff Accounts
-  const [staffList, setStaffList] = useState<AuthUser[]>([]);
-  const [newUsername, setNewUsername] = useState('');
-  const [newFullName, setNewFullName] = useState('');
-  const [newEmail, setNewEmail] = useState('');
-  const [newPassword, setNewPassword] = useState('');
-  const [newRole, setNewRole] = useState<UserRole>('staff');
-
-  // Password Change
-  const [currPass, setCurrPass] = useState('');
-  const [nextPass, setNextPass] = useState('');
-  const [profileName, setProfileName] = useState(user.full_name);
-  const [profileUsername, setProfileUsername] = useState(user.username);
-
   useEffect(() => {
     setForm(settings);
   }, [settings]);
-
-  const loadUsers = () => {
-    if (!isOwner) return;
-    apiFetch<{ users: AuthUser[] }>('/api/users')
-      .then((r) => setStaffList(r.users || []))
-      .catch(() => {});
-  };
-
-  useEffect(() => {
-    if (tab === 'users' && isOwner) loadUsers();
-  }, [tab, isOwner]);
 
   const handleSaveBusiness = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -102,66 +71,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       setError(err.message || 'Failed to upload logo.');
     } finally {
       setUploadingLogo(false);
-    }
-  };
-
-  const handleCreateStaff = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    setNotice('');
-    try {
-      await apiFetch('/api/users', {
-        method: 'POST',
-        body: JSON.stringify({
-          username: newUsername,
-          full_name: newFullName,
-          email: newEmail,
-          password: newPassword,
-          role: newRole,
-        }),
-      });
-      setNewUsername('');
-      setNewFullName('');
-      setNewEmail('');
-      setNewPassword('');
-      setNotice('Authorized user account created.');
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || 'Failed to create staff account.');
-    }
-  };
-
-  const handleToggleUserActive = async (u: AuthUser) => {
-    try {
-      await apiFetch(`/api/users/${u.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({ is_active: !u.is_active }),
-      });
-      loadUsers();
-    } catch (err: any) {
-      setError(err.message || 'Failed to update user status.');
-    }
-  };
-
-  const handleChangePassword = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError('');
-    setNotice('');
-    try {
-      await apiFetch('/api/auth/change-password', {
-        method: 'POST',
-        body: JSON.stringify({
-          current_password: currPass,
-          new_password: nextPass,
-          full_name: profileName,
-          username: profileUsername,
-        }),
-      });
-      setCurrPass('');
-      setNextPass('');
-      setNotice('Account credentials updated.');
-    } catch (err: any) {
-      setError(err.message || 'Failed to update password.');
     }
   };
 
@@ -211,7 +120,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       <div className="pb-4 border-b border-slate-200">
         <h1 className="text-xl font-bold text-slate-900 tracking-tight">Business Settings</h1>
         <p className="text-xs text-slate-600 mt-0.5">
-          Manage official shop identity, document numbering, default terms, staff permissions, and full database backups.
+          Manage official shop identity, document numbering, default terms, authorized signatory, and full database backups.
         </p>
       </div>
 
@@ -228,46 +137,18 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         >
           Business Profile & Document Defaults
         </button>
-        {isOwner && (
-          <button
-            type="button"
-            onClick={() => setTab('users')}
-            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs font-semibold ${
-              tab === 'users'
-                ? 'bg-slate-900 text-white'
-                : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
-            }`}
-          >
-            <Users className="w-3.5 h-3.5" />
-            Authorized Staff & Roles
-          </button>
-        )}
         <button
           type="button"
-          onClick={() => setTab('security')}
+          onClick={() => setTab('backup')}
           className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs font-semibold ${
-            tab === 'security'
+            tab === 'backup'
               ? 'bg-slate-900 text-white'
               : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
           }`}
         >
-          <Lock className="w-3.5 h-3.5" />
-          Account & Password
+          <Database className="w-3.5 h-3.5" />
+          Backup & Restore
         </button>
-        {isOwner && (
-          <button
-            type="button"
-            onClick={() => setTab('backup')}
-            className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs font-semibold ${
-              tab === 'backup'
-                ? 'bg-slate-900 text-white'
-                : 'bg-white border border-slate-300 text-slate-700 hover:bg-slate-50'
-            }`}
-          >
-            <Database className="w-3.5 h-3.5" />
-            Backup & Restore
-          </button>
-        )}
       </div>
 
       {notice && (
@@ -316,19 +197,17 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <div className="space-y-1.5">
                 <div className="text-xs font-semibold text-slate-800">Official Business Logo</div>
                 <div className="flex items-center gap-2">
-                  {isOwner && (
-                    <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer">
-                      <Upload className="w-3.5 h-3.5" />
-                      {uploadingLogo ? 'Uploading...' : 'Upload Logo (PNG/JPG)'}
-                      <input
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp,image/svg+xml"
-                        onChange={handleLogoUpload}
-                        className="hidden"
-                      />
-                    </label>
-                  )}
-                  {isOwner && form.logo_url && (
+                  <label className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-50 cursor-pointer">
+                    <Upload className="w-3.5 h-3.5" />
+                    {uploadingLogo ? 'Uploading...' : 'Upload Logo (PNG/JPG)'}
+                    <input
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                      onChange={handleLogoUpload}
+                      className="hidden"
+                    />
+                  </label>
+                  {form.logo_url && (
                     <button
                       type="button"
                       onClick={() => setForm({ ...form, logo_url: '' })}
@@ -352,10 +231,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <input
                   type="text"
                   required
-                  disabled={!isOwner}
                   value={form.business_name}
                   onChange={(e) => setForm({ ...form, business_name: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
 
@@ -365,11 +243,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.address}
                   onChange={(e) => setForm({ ...form, address: e.target.value })}
                   placeholder="Enter complete shop address"
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
 
@@ -379,11 +256,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.contact_number}
                   onChange={(e) => setForm({ ...form, contact_number: e.target.value })}
                   placeholder="Mobile / Landline number"
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
 
@@ -393,11 +269,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="email"
-                  disabled={!isOwner}
                   value={form.email}
                   onChange={(e) => setForm({ ...form, email: e.target.value })}
                   placeholder="Supply official business email when available"
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
 
@@ -407,10 +282,9 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="url"
-                  disabled={!isOwner}
                   value={form.facebook_url}
                   onChange={(e) => setForm({ ...form, facebook_url: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
 
@@ -420,10 +294,34 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="url"
-                  disabled={!isOwner}
                   value={form.maps_url}
                   onChange={(e) => setForm({ ...form, maps_url: e.target.value })}
-                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded disabled:bg-slate-100"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1">
+                  Operating Hours
+                </label>
+                <input
+                  type="text"
+                  value={form.operating_hours}
+                  onChange={(e) => setForm({ ...form, operating_hours: e.target.value })}
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-600 mb-1">
+                  Other Social / Website Links
+                </label>
+                <input
+                  type="text"
+                  value={form.other_social_links}
+                  onChange={(e) => setForm({ ...form, other_social_links: e.target.value })}
+                  placeholder="Optional Instagram / Viber / Website"
+                  className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
                 />
               </div>
             </div>
@@ -442,7 +340,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.quotation_prefix}
                   onChange={(e) => setForm({ ...form, quotation_prefix: e.target.value })}
                   className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
@@ -454,7 +351,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.invoice_prefix}
                   onChange={(e) => setForm({ ...form, invoice_prefix: e.target.value })}
                   className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
@@ -466,7 +362,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.service_report_prefix}
                   onChange={(e) => setForm({ ...form, service_report_prefix: e.target.value })}
                   className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
@@ -478,7 +373,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.billing_statement_prefix}
                   onChange={(e) => setForm({ ...form, billing_statement_prefix: e.target.value })}
                   className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
@@ -492,7 +386,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   type="number"
                   min={3}
                   max={8}
-                  disabled={!isOwner}
                   value={form.doc_number_padding}
                   onChange={(e) =>
                     setForm({ ...form, doc_number_padding: Number(e.target.value) || 4 })
@@ -505,7 +398,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-700">
               <input
                 type="checkbox"
-                disabled={!isOwner}
                 checked={Boolean(form.include_year_in_doc_num)}
                 onChange={(e) =>
                   setForm({ ...form, include_year_in_doc_num: e.target.checked ? 1 : 0 })
@@ -522,7 +414,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <textarea
                   rows={2}
-                  disabled={!isOwner}
                   value={form.default_payment_terms}
                   onChange={(e) => setForm({ ...form, default_payment_terms: e.target.value })}
                   className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
@@ -534,7 +425,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <textarea
                   rows={2}
-                  disabled={!isOwner}
                   value={form.default_notes}
                   onChange={(e) => setForm({ ...form, default_notes: e.target.value })}
                   placeholder="Optional standard warranty or fabrication notes"
@@ -557,7 +447,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.authorized_representative}
                   onChange={(e) => setForm({ ...form, authorized_representative: e.target.value })}
                   placeholder="Supply owner / authorized signatory full name"
@@ -570,7 +459,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 </label>
                 <input
                   type="text"
-                  disabled={!isOwner}
                   value={form.authorized_title}
                   onChange={(e) => setForm({ ...form, authorized_title: e.target.value })}
                   placeholder="e.g., Proprietor / Shop Manager"
@@ -596,17 +484,15 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     className="h-10 bg-white border border-slate-300 rounded px-2 object-contain"
                   />
                 )}
-                {isOwner && (
-                  <button
-                    type="button"
-                    onClick={() => setSigModalOpen(true)}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-100"
-                  >
-                    <PenTool className="w-3.5 h-3.5" />
-                    {form.signature_url ? 'Update Signature' : 'Draw / Upload Signature'}
-                  </button>
-                )}
-                {isOwner && form.signature_url && (
+                <button
+                  type="button"
+                  onClick={() => setSigModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded border border-slate-300 bg-white text-xs font-medium text-slate-700 hover:bg-slate-100"
+                >
+                  <PenTool className="w-3.5 h-3.5" />
+                  {form.signature_url ? 'Update Signature' : 'Draw / Upload Signature'}
+                </button>
+                {form.signature_url && (
                   <button
                     type="button"
                     onClick={() => setForm({ ...form, signature_url: '' })}
@@ -622,7 +508,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
               <label className="inline-flex items-center gap-2 text-sm font-medium text-slate-800">
                 <input
                   type="checkbox"
-                  disabled={!isOwner}
                   checked={Boolean(form.tax_enabled)}
                   onChange={(e) => setForm({ ...form, tax_enabled: e.target.checked ? 1 : 0 })}
                   className="rounded border-slate-300"
@@ -634,7 +519,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
-                    disabled={!isOwner}
                     value={form.tax_label}
                     onChange={(e) => setForm({ ...form, tax_label: e.target.value })}
                     placeholder="Tax Label (e.g. VAT)"
@@ -645,7 +529,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     min="0"
                     max="100"
                     step="0.01"
-                    disabled={!isOwner}
                     value={form.tax_rate}
                     onChange={(e) =>
                       setForm({ ...form, tax_rate: parseFloat(e.target.value) || 0 })
@@ -658,198 +541,21 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
             </div>
           </div>
 
-          {isOwner && (
-            <div className="flex justify-end">
-              <button
-                type="submit"
-                disabled={saving}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
-              >
-                <Save className="w-4 h-4" />
-                {saving ? 'Saving Settings...' : 'Save Business Settings'}
-              </button>
-            </div>
-          )}
-        </form>
-      )}
-
-      {/* TAB 2: AUTHORIZED STAFF & RBAC */}
-      {tab === 'users' && isOwner && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          <div className="lg:col-span-2 bg-white border border-slate-200 rounded-md overflow-hidden">
-            <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 font-bold text-xs uppercase tracking-wider text-slate-700">
-              Authorized Accounts ({staffList.length})
-            </div>
-            <table className="w-full text-sm">
-              <thead className="border-b border-slate-200 text-xs text-slate-500 uppercase">
-                <tr>
-                  <th className="py-2.5 px-4 text-left">Name</th>
-                  <th className="py-2.5 px-4 text-left">Username</th>
-                  <th className="py-2.5 px-4 text-left">Role</th>
-                  <th className="py-2.5 px-4 text-left">Status</th>
-                  <th className="py-2.5 px-4 text-right">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {staffList.map((u) => (
-                  <tr key={u.id}>
-                    <td className="py-2.5 px-4 font-medium text-slate-900">{u.full_name}</td>
-                    <td className="py-2.5 px-4 font-mono text-xs text-slate-600">{u.username}</td>
-                    <td className="py-2.5 px-4 capitalize text-xs font-semibold">{u.role}</td>
-                    <td className="py-2.5 px-4 text-xs">
-                      {u.is_active ? (
-                        <span className="text-emerald-700 font-semibold">Active</span>
-                      ) : (
-                        <span className="text-slate-400">Disabled</span>
-                      )}
-                    </td>
-                    <td className="py-2.5 px-4 text-right">
-                      {u.id !== user.id && (
-                        <button
-                          type="button"
-                          onClick={() => handleToggleUserActive(u)}
-                          className="text-xs font-medium text-sky-700 hover:underline"
-                        >
-                          {u.is_active ? 'Disable' : 'Enable'}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          <form
-            onSubmit={handleCreateStaff}
-            className="bg-white border border-slate-200 rounded-md p-4 space-y-3"
-          >
-            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
-              <Plus className="w-3.5 h-3.5" />
-              Add Authorized Staff Account
-            </h3>
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Full Name *</label>
-              <input
-                type="text"
-                required
-                value={newFullName}
-                onChange={(e) => setNewFullName(e.target.value)}
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Username *</label>
-              <input
-                type="text"
-                required
-                value={newUsername}
-                onChange={(e) => setNewUsername(e.target.value)}
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded"
-              />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">Role</label>
-              <select
-                value={newRole}
-                onChange={(e) => setNewRole(e.target.value as UserRole)}
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded bg-white"
-              >
-                <option value="staff">Staff (Documents & Customers)</option>
-                <option value="technician">Technician (Service Reports & Catalog)</option>
-                <option value="owner">Owner / Administrator</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-1">
-                Initial Password (min 6 chars) *
-              </label>
-              <input
-                type="password"
-                required
-                minLength={6}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                className="w-full px-3 py-1.5 text-sm border border-slate-300 rounded"
-              />
-            </div>
+          <div className="flex justify-end">
             <button
               type="submit"
-              className="w-full py-2 rounded bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
+              disabled={saving}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800 disabled:opacity-50"
             >
-              Create Account
+              <Save className="w-4 h-4" />
+              {saving ? 'Saving Settings...' : 'Save Business Settings'}
             </button>
-          </form>
-        </div>
-      )}
-
-      {/* TAB 3: PASSWORD & PROFILE SECURITY */}
-      {tab === 'security' && (
-        <form
-          onSubmit={handleChangePassword}
-          className="max-w-md bg-white border border-slate-200 rounded-md p-5 space-y-4"
-        >
-          <h2 className="text-sm font-bold text-slate-900">Update Your Login Credentials</h2>
-          <div>
-            <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-              Display Name
-            </label>
-            <input
-              type="text"
-              required
-              value={profileName}
-              onChange={(e) => setProfileName(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
-            />
           </div>
-          <div>
-            <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-              Username
-            </label>
-            <input
-              type="text"
-              required
-              value={profileUsername}
-              onChange={(e) => setProfileUsername(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-              Current Password *
-            </label>
-            <input
-              type="password"
-              required
-              value={currPass}
-              onChange={(e) => setCurrPass(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-semibold uppercase text-slate-600 mb-1">
-              New Password (min 6 characters) *
-            </label>
-            <input
-              type="password"
-              required
-              minLength={6}
-              value={nextPass}
-              onChange={(e) => setNextPass(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-slate-300 rounded"
-            />
-          </div>
-          <button
-            type="submit"
-            className="px-5 py-2 rounded bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
-          >
-            Update Credentials
-          </button>
         </form>
       )}
 
-      {/* TAB 4: BACKUP & DATA EXPORT */}
-      {tab === 'backup' && isOwner && (
+      {/* TAB 2: BACKUP & DATA EXPORT */}
+      {tab === 'backup' && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           <div className="bg-white border border-slate-200 rounded-md p-5 space-y-3">
             <h2 className="text-sm font-bold text-slate-900">Export Complete System Backup</h2>

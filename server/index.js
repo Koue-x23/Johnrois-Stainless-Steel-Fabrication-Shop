@@ -1,6 +1,5 @@
 import express from 'express';
 import compression from 'compression';
-import cookieParser from 'cookie-parser';
 import multer from 'multer';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -12,8 +11,6 @@ import {
   round2,
   nowISO,
   todayYMD,
-  hashPassword,
-  verifyPassword,
   getSettings,
   previewNextDocNumber,
   allocateNextDocNumber,
@@ -35,7 +32,6 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.disable('x-powered-by');
 app.use(compression());
-app.use(cookieParser());
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
@@ -62,58 +58,16 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// Helper: Extract session user
-function getSessionUser(req) {
-  let token = '';
-  const authHeader = req.headers.authorization || '';
-  if (authHeader.startsWith('Bearer ')) {
-    token = authHeader.slice(7).trim();
-  } else if (req.cookies?.johnrois_session) {
-    token = req.cookies.johnrois_session;
-  } else if (typeof req.query?.token === 'string') {
-    token = req.query.token;
-  }
-  if (!token) return null;
-
-  const session = db.prepare(`
-    SELECT s.token, s.expires_at, u.id, u.username, u.full_name, u.email, u.role, u.is_active, u.is_initial_setup
-    FROM sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.token = ?
-  `).get(token);
-
-  if (!session) return null;
-  if (!session.is_active) return null;
-  if (session.expires_at < nowISO()) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(token);
-    return null;
-  }
-  return {
-    id: session.id,
-    username: session.username,
-    full_name: session.full_name,
-    email: session.email,
-    role: session.role,
-    is_initial_setup: Boolean(session.is_initial_setup),
-    token: session.token,
+// Attach direct internal workspace operator context (no login gate; SQLite stays strictly server-side)
+app.use('/api', (req, _res, next) => {
+  const settings = getSettings();
+  req.user = {
+    id: null,
+    full_name: settings?.authorized_representative || '',
+    role: 'owner',
   };
-}
-
-function requireAuth(req, res, next) {
-  const user = getSessionUser(req);
-  if (!user) {
-    return res.status(401).json({ error: 'Authentication required. Please sign in.' });
-  }
-  req.user = user;
   next();
-}
-
-function requireOwner(req, res, next) {
-  if (!req.user || req.user.role !== 'owner') {
-    return res.status(403).json({ error: 'Owner / Administrator permission is required for this action.' });
-  }
-  next();
-}
+});
 
 function getIdempotencyHit(req, entityType) {
   const key = req.headers['x-idempotency-key'];
@@ -216,194 +170,10 @@ function computeTotalsFromItems(rawItems, discountType, discountValue, taxEnable
 }
 
 // ============================================================================
-// AUTHENTICATION & USER MANAGEMENT
-// ============================================================================
-
-app.get('/api/auth/status', (req, res) => {
-  const user = getSessionUser(req);
-  const settings = getSettings();
-  const initialAdmin = db.prepare(`
-    SELECT username, is_initial_setup FROM users WHERE username = 'admin' AND is_initial_setup = 1 LIMIT 1
-  `).get();
-
-  res.json({
-    authenticated: Boolean(user),
-    user: user
-      ? {
-          id: user.id,
-          username: user.username,
-          full_name: user.full_name,
-          email: user.email,
-          role: user.role,
-          is_initial_setup: user.is_initial_setup,
-        }
-      : null,
-    show_initial_setup_hint: Boolean(initialAdmin),
-    business: {
-      business_name: settings.business_name,
-      logo_url: settings.logo_url,
-      address: settings.address,
-      contact_number: settings.contact_number,
-      facebook_url: settings.facebook_url,
-    },
-  });
-});
-
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body || {};
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required.' });
-  }
-
-  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(String(username).trim());
-  if (!user || !user.is_active || !verifyPassword(String(password), user.password_hash)) {
-    return res.status(401).json({ error: 'Invalid username or password.' });
-  }
-
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-  db.prepare(`
-    INSERT INTO sessions (token, user_id, expires_at, user_agent, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(token, user.id, expiresAt, String(req.headers['user-agent'] || '').slice(0, 250), nowISO());
-
-  res.cookie('johnrois_session', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-    path: '/',
-  });
-
-  res.json({
-    token,
-    user: {
-      id: user.id,
-      username: user.username,
-      full_name: user.full_name,
-      email: user.email,
-      role: user.role,
-      is_initial_setup: Boolean(user.is_initial_setup),
-    },
-  });
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  const user = getSessionUser(req);
-  if (user?.token) {
-    db.prepare('DELETE FROM sessions WHERE token = ?').run(user.token);
-  }
-  res.clearCookie('johnrois_session', { path: '/' });
-  res.json({ ok: true });
-});
-
-app.post('/api/auth/change-password', requireAuth, (req, res) => {
-  const { current_password, new_password, full_name, username } = req.body || {};
-  const userRow = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
-  if (!verifyPassword(String(current_password || ''), userRow.password_hash)) {
-    return res.status(400).json({ error: 'Current password is incorrect.' });
-  }
-  if (!new_password || String(new_password).length < 6) {
-    return res.status(400).json({ error: 'New password must be at least 6 characters.' });
-  }
-
-  const nextUsername = username?.trim() ? username.trim() : userRow.username;
-  const nextName = full_name?.trim() ? full_name.trim() : userRow.full_name;
-
-  const conflict = db.prepare('SELECT id FROM users WHERE username = ? AND id != ?').get(nextUsername, req.user.id);
-  if (conflict) {
-    return res.status(400).json({ error: 'That username is already taken.' });
-  }
-
-  db.prepare(`
-    UPDATE users
-    SET username = ?, full_name = ?, password_hash = ?, is_initial_setup = 0, updated_at = ?
-    WHERE id = ?
-  `).run(nextUsername, nextName, hashPassword(String(new_password)), nowISO(), req.user.id);
-
-  res.json({ ok: true });
-});
-
-app.get('/api/users', requireAuth, requireOwner, (_req, res) => {
-  const users = db.prepare(`
-    SELECT id, username, full_name, email, role, is_active, created_at, updated_at
-    FROM users
-    ORDER BY id ASC
-  `).all();
-  res.json({ users });
-});
-
-app.post('/api/users', requireAuth, requireOwner, (req, res) => {
-  const { username, full_name, email, password, role } = req.body || {};
-  if (!username?.trim() || !full_name?.trim() || !password || String(password).length < 6) {
-    return res.status(400).json({ error: 'Username, full name, and a password (min 6 chars) are required.' });
-  }
-  const validRole = ['owner', 'staff', 'technician'].includes(role) ? role : 'staff';
-  const exists = db.prepare('SELECT id FROM users WHERE username = ?').get(username.trim());
-  if (exists) {
-    return res.status(400).json({ error: 'Username already exists.' });
-  }
-  const now = nowISO();
-  const result = db.prepare(`
-    INSERT INTO users (username, full_name, email, password_hash, role, is_active, is_initial_setup, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)
-  `).run(username.trim(), full_name.trim(), (email || '').trim(), hashPassword(String(password)), validRole, now, now);
-
-  logActivity({
-    entity_type: 'settings',
-    entity_id: Number(result.lastInsertRowid),
-    action: 'user_created',
-    summary: `Added staff account "${full_name.trim()}" (${validRole})`,
-    actor_name: req.user.full_name,
-  });
-
-  res.status(201).json({ id: Number(result.lastInsertRowid) });
-});
-
-app.put('/api/users/:id', requireAuth, requireOwner, (req, res) => {
-  const targetId = Number(req.params.id);
-  const existing = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId);
-  if (!existing) return res.status(404).json({ error: 'User not found.' });
-
-  const { full_name, email, role, is_active, new_password } = req.body || {};
-  const validRole = ['owner', 'staff', 'technician'].includes(role) ? role : existing.role;
-  const activeFlag = is_active !== undefined ? (is_active ? 1 : 0) : existing.is_active;
-
-  // Prevent locking out the last active owner
-  if (existing.role === 'owner' && (validRole !== 'owner' || activeFlag === 0)) {
-    const otherOwners = db.prepare(`
-      SELECT COUNT(*) as cnt FROM users WHERE role = 'owner' AND is_active = 1 AND id != ?
-    `).get(targetId).cnt;
-    if (otherOwners === 0) {
-      return res.status(400).json({ error: 'At least one active Owner account must remain.' });
-    }
-  }
-
-  const nextHash = new_password && String(new_password).length >= 6
-    ? hashPassword(String(new_password))
-    : existing.password_hash;
-
-  db.prepare(`
-    UPDATE users
-    SET full_name = ?, email = ?, role = ?, is_active = ?, password_hash = ?, is_initial_setup = 0, updated_at = ?
-    WHERE id = ?
-  `).run(
-    full_name?.trim() || existing.full_name,
-    email !== undefined ? String(email).trim() : existing.email,
-    validRole,
-    activeFlag,
-    nextHash,
-    nowISO(),
-    targetId
-  );
-
-  res.json({ ok: true });
-});
-
-// ============================================================================
 // UPLOADS (LOGOS, SIGNATURES, SERVICE PHOTOS)
 // ============================================================================
 
-app.post('/api/uploads', requireAuth, upload.single('file'), (req, res) => {
+app.post('/api/uploads', upload.single('file'), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No image file provided.' });
   }
@@ -413,7 +183,7 @@ app.post('/api/uploads', requireAuth, upload.single('file'), (req, res) => {
   });
 });
 
-app.post('/api/uploads/data-url', requireAuth, (req, res) => {
+app.post('/api/uploads/data-url', (req, res) => {
   const { data_url } = req.body || {};
   if (!data_url || typeof data_url !== 'string' || !data_url.startsWith('data:image/')) {
     return res.status(400).json({ error: 'Valid image data URL is required.' });
@@ -433,11 +203,11 @@ app.post('/api/uploads/data-url', requireAuth, (req, res) => {
 // BUSINESS SETTINGS
 // ============================================================================
 
-app.get('/api/settings', requireAuth, (_req, res) => {
+app.get('/api/settings', (_req, res) => {
   res.json({ settings: getSettings() });
 });
 
-app.put('/api/settings', requireAuth, requireOwner, (req, res) => {
+app.put('/api/settings', (req, res) => {
   const b = req.body || {};
   if (!b.business_name?.trim()) {
     return res.status(400).json({ error: 'Business name is required.' });
@@ -522,7 +292,7 @@ app.put('/api/settings', requireAuth, requireOwner, (req, res) => {
 // DASHBOARD & GLOBAL SEARCH
 // ============================================================================
 
-app.get('/api/dashboard', requireAuth, (_req, res) => {
+app.get('/api/dashboard', (_req, res) => {
   refreshTimeSensitiveStatuses();
 
   const quoteStats = db.prepare(`
@@ -621,7 +391,7 @@ app.get('/api/dashboard', requireAuth, (_req, res) => {
   });
 });
 
-app.get('/api/search', requireAuth, (req, res) => {
+app.get('/api/search', (req, res) => {
   const q = String(req.query.q || '').trim();
   if (!q) return res.json({ results: [] });
   const like = `%${q}%`;
@@ -670,7 +440,7 @@ app.get('/api/search', requireAuth, (req, res) => {
 // CUSTOMERS MODULE
 // ============================================================================
 
-app.get('/api/customers', requireAuth, (req, res) => {
+app.get('/api/customers', (req, res) => {
   const search = String(req.query.search || '').trim();
   const status = String(req.query.status || 'active'); // active | archived | all
 
@@ -699,7 +469,7 @@ app.get('/api/customers', requireAuth, (req, res) => {
   res.json({ customers });
 });
 
-app.get('/api/customers/:id', requireAuth, (req, res) => {
+app.get('/api/customers/:id', (req, res) => {
   const id = Number(req.params.id);
   const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
   if (!customer) return res.status(404).json({ error: 'Customer not found.' });
@@ -746,7 +516,7 @@ app.get('/api/customers/:id', requireAuth, (req, res) => {
   });
 });
 
-app.post('/api/customers', requireAuth, (req, res) => {
+app.post('/api/customers', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'customer');
   if (idemHit) {
     const existing = db.prepare('SELECT * FROM customers WHERE id = ?').get(idemHit);
@@ -797,7 +567,7 @@ app.post('/api/customers', requireAuth, (req, res) => {
   res.status(201).json({ customer: created });
 });
 
-app.put('/api/customers/:id', requireAuth, (req, res) => {
+app.put('/api/customers/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Customer not found.' });
@@ -834,7 +604,7 @@ app.put('/api/customers/:id', requireAuth, (req, res) => {
   res.json({ customer: updated });
 });
 
-app.patch('/api/customers/:id/archive', requireAuth, (req, res) => {
+app.patch('/api/customers/:id/archive', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Customer not found.' });
@@ -860,7 +630,7 @@ app.patch('/api/customers/:id/archive', requireAuth, (req, res) => {
 // PRODUCTS & SERVICES MODULE
 // ============================================================================
 
-app.get('/api/products', requireAuth, (req, res) => {
+app.get('/api/products', (req, res) => {
   const search = String(req.query.search || '').trim();
   const category = String(req.query.category || '');
   const status = String(req.query.status || 'active');
@@ -884,7 +654,7 @@ app.get('/api/products', requireAuth, (req, res) => {
   res.json({ products });
 });
 
-app.post('/api/products', requireAuth, (req, res) => {
+app.post('/api/products', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'product');
   if (idemHit) {
     const existing = db.prepare('SELECT * FROM products_services WHERE id = ?').get(idemHit);
@@ -922,7 +692,7 @@ app.post('/api/products', requireAuth, (req, res) => {
   res.status(201).json({ product });
 });
 
-app.put('/api/products/:id', requireAuth, (req, res) => {
+app.put('/api/products/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM products_services WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Item not found.' });
@@ -949,7 +719,7 @@ app.put('/api/products/:id', requireAuth, (req, res) => {
   res.json({ product: db.prepare('SELECT * FROM products_services WHERE id = ?').get(id) });
 });
 
-app.delete('/api/products/:id', requireAuth, (req, res) => {
+app.delete('/api/products/:id', (req, res) => {
   const id = Number(req.params.id);
   db.prepare('UPDATE products_services SET is_archived = 1, updated_at = ? WHERE id = ?').run(nowISO(), id);
   res.json({ ok: true });
@@ -971,12 +741,12 @@ function getFullQuotation(id) {
   return { ...quotation, converted_invoice_number, items };
 }
 
-app.get('/api/quotations/next-number', requireAuth, (req, res) => {
+app.get('/api/quotations/next-number', (req, res) => {
   const dateStr = String(req.query.date || todayYMD());
   res.json({ next_number: previewNextDocNumber('quotation', dateStr) });
 });
 
-app.get('/api/quotations', requireAuth, (req, res) => {
+app.get('/api/quotations', (req, res) => {
   refreshTimeSensitiveStatuses();
   const search = String(req.query.search || '').trim();
   const status = String(req.query.status || 'all');
@@ -1011,14 +781,14 @@ app.get('/api/quotations', requireAuth, (req, res) => {
   res.json({ quotations });
 });
 
-app.get('/api/quotations/:id', requireAuth, (req, res) => {
+app.get('/api/quotations/:id', (req, res) => {
   refreshTimeSensitiveStatuses();
   const full = getFullQuotation(Number(req.params.id));
   if (!full) return res.status(404).json({ error: 'Quotation not found.' });
   res.json({ quotation: full });
 });
 
-app.post('/api/quotations', requireAuth, (req, res) => {
+app.post('/api/quotations', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'quotation');
   if (idemHit) {
     const existing = getFullQuotation(idemHit);
@@ -1116,7 +886,7 @@ app.post('/api/quotations', requireAuth, (req, res) => {
   res.status(201).json({ quotation: created });
 });
 
-app.put('/api/quotations/:id', requireAuth, (req, res) => {
+app.put('/api/quotations/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM quotations WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
@@ -1201,7 +971,7 @@ app.put('/api/quotations/:id', requireAuth, (req, res) => {
   res.json({ quotation: updated });
 });
 
-app.patch('/api/quotations/:id/status', requireAuth, (req, res) => {
+app.patch('/api/quotations/:id/status', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM quotations WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
@@ -1229,7 +999,7 @@ app.patch('/api/quotations/:id/status', requireAuth, (req, res) => {
   res.json({ quotation: getFullQuotation(id) });
 });
 
-app.post('/api/quotations/:id/convert-to-invoice', requireAuth, (req, res) => {
+app.post('/api/quotations/:id/convert-to-invoice', (req, res) => {
   const qId = Number(req.params.id);
   const fullQuote = getFullQuotation(qId);
   if (!fullQuote) return res.status(404).json({ error: 'Quotation not found.' });
@@ -1334,7 +1104,7 @@ app.post('/api/quotations/:id/convert-to-invoice', requireAuth, (req, res) => {
   res.status(201).json({ invoice: getFullInvoice(createdInvoice) });
 });
 
-app.delete('/api/quotations/:id', requireAuth, (req, res) => {
+app.delete('/api/quotations/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM quotations WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
@@ -1352,7 +1122,7 @@ app.delete('/api/quotations/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/quotations/:id/pdf', requireAuth, async (req, res) => {
+app.get('/api/quotations/:id/pdf', async (req, res) => {
   try {
     const full = getFullQuotation(Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Quotation not found.' });
@@ -1378,12 +1148,12 @@ function getFullInvoice(id) {
   return { ...invoice, items, payments };
 }
 
-app.get('/api/invoices/next-number', requireAuth, (req, res) => {
+app.get('/api/invoices/next-number', (req, res) => {
   const dateStr = String(req.query.date || todayYMD());
   res.json({ next_number: previewNextDocNumber('invoice', dateStr) });
 });
 
-app.get('/api/invoices', requireAuth, (req, res) => {
+app.get('/api/invoices', (req, res) => {
   refreshTimeSensitiveStatuses();
   const search = String(req.query.search || '').trim();
   const status = String(req.query.status || 'all');
@@ -1424,14 +1194,14 @@ app.get('/api/invoices', requireAuth, (req, res) => {
   res.json({ invoices });
 });
 
-app.get('/api/invoices/:id', requireAuth, (req, res) => {
+app.get('/api/invoices/:id', (req, res) => {
   refreshTimeSensitiveStatuses();
   const full = getFullInvoice(Number(req.params.id));
   if (!full) return res.status(404).json({ error: 'Invoice not found.' });
   res.json({ invoice: full });
 });
 
-app.post('/api/invoices', requireAuth, (req, res) => {
+app.post('/api/invoices', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'invoice');
   if (idemHit) {
     const existing = getFullInvoice(idemHit);
@@ -1566,7 +1336,7 @@ app.post('/api/invoices', requireAuth, (req, res) => {
   res.status(201).json({ invoice: getFullInvoice(createdId) });
 });
 
-app.put('/api/invoices/:id', requireAuth, (req, res) => {
+app.put('/api/invoices/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM invoices WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Invoice not found.' });
@@ -1653,7 +1423,7 @@ app.put('/api/invoices/:id', requireAuth, (req, res) => {
   res.json({ invoice: getFullInvoice(id) });
 });
 
-app.post('/api/invoices/:id/payments', requireAuth, (req, res) => {
+app.post('/api/invoices/:id/payments', (req, res) => {
   const invoiceId = Number(req.params.id);
   const idemHit = getIdempotencyHit(req, 'payment');
   if (idemHit) {
@@ -1719,7 +1489,7 @@ app.post('/api/invoices/:id/payments', requireAuth, (req, res) => {
   res.status(201).json({ invoice: getFullInvoice(invoiceId) });
 });
 
-app.get('/api/payments', requireAuth, (req, res) => {
+app.get('/api/payments', (req, res) => {
   const search = String(req.query.search || '').trim();
   const method = String(req.query.method || 'all');
   const dateFrom = String(req.query.date_from || '');
@@ -1756,7 +1526,7 @@ app.get('/api/payments', requireAuth, (req, res) => {
   res.json({ payments });
 });
 
-app.delete('/api/payments/:id', requireAuth, (req, res) => {
+app.delete('/api/payments/:id', (req, res) => {
   const id = Number(req.params.id);
   const payment = db.prepare('SELECT * FROM payments WHERE id = ?').get(id);
   if (!payment) return res.status(404).json({ error: 'Payment record not found.' });
@@ -1782,7 +1552,7 @@ app.delete('/api/payments/:id', requireAuth, (req, res) => {
   res.json({ ok: true, invoice: getFullInvoice(payment.invoice_id) });
 });
 
-app.delete('/api/invoices/:id', requireAuth, (req, res) => {
+app.delete('/api/invoices/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM invoices WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Invoice not found.' });
@@ -1801,7 +1571,7 @@ app.delete('/api/invoices/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/invoices/:id/pdf', requireAuth, async (req, res) => {
+app.get('/api/invoices/:id/pdf', async (req, res) => {
   try {
     refreshTimeSensitiveStatuses();
     const full = getFullInvoice(Number(req.params.id));
@@ -1828,12 +1598,12 @@ function getFullServiceReport(id) {
   return { ...report, materials, photos };
 }
 
-app.get('/api/service-reports/next-number', requireAuth, (req, res) => {
+app.get('/api/service-reports/next-number', (req, res) => {
   const dateStr = String(req.query.date || todayYMD());
   res.json({ next_number: previewNextDocNumber('service_report', dateStr) });
 });
 
-app.get('/api/service-reports', requireAuth, (req, res) => {
+app.get('/api/service-reports', (req, res) => {
   const search = String(req.query.search || '').trim();
   const status = String(req.query.status || 'all');
   const dateFrom = String(req.query.date_from || '');
@@ -1863,13 +1633,13 @@ app.get('/api/service-reports', requireAuth, (req, res) => {
   res.json({ service_reports: reports });
 });
 
-app.get('/api/service-reports/:id', requireAuth, (req, res) => {
+app.get('/api/service-reports/:id', (req, res) => {
   const full = getFullServiceReport(Number(req.params.id));
   if (!full) return res.status(404).json({ error: 'Service report not found.' });
   res.json({ service_report: full });
 });
 
-app.post('/api/service-reports', requireAuth, (req, res) => {
+app.post('/api/service-reports', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'service_report');
   if (idemHit) {
     const existing = getFullServiceReport(idemHit);
@@ -1982,7 +1752,7 @@ app.post('/api/service-reports', requireAuth, (req, res) => {
   res.status(201).json({ service_report: getFullServiceReport(createdId) });
 });
 
-app.put('/api/service-reports/:id', requireAuth, (req, res) => {
+app.put('/api/service-reports/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM service_reports WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Service report not found.' });
@@ -2088,7 +1858,7 @@ app.put('/api/service-reports/:id', requireAuth, (req, res) => {
   res.json({ service_report: getFullServiceReport(id) });
 });
 
-app.delete('/api/service-reports/:id', requireAuth, (req, res) => {
+app.delete('/api/service-reports/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM service_reports WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Service report not found.' });
@@ -2106,7 +1876,7 @@ app.delete('/api/service-reports/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/service-reports/:id/pdf', requireAuth, async (req, res) => {
+app.get('/api/service-reports/:id/pdf', async (req, res) => {
   try {
     const full = getFullServiceReport(Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Service report not found.' });
@@ -2131,12 +1901,12 @@ function getFullBillingStatement(id) {
   return { ...statement, lines };
 }
 
-app.get('/api/billing-statements/next-number', requireAuth, (req, res) => {
+app.get('/api/billing-statements/next-number', (req, res) => {
   const dateStr = String(req.query.date || todayYMD());
   res.json({ next_number: previewNextDocNumber('billing_statement', dateStr) });
 });
 
-app.get('/api/billing-statements/preview', requireAuth, (req, res) => {
+app.get('/api/billing-statements/preview', (req, res) => {
   const customerId = Number(req.query.customer_id);
   const periodFrom = String(req.query.period_from || '');
   const periodTo = String(req.query.period_to || '');
@@ -2155,7 +1925,7 @@ app.get('/api/billing-statements/preview', requireAuth, (req, res) => {
   res.json({ customer, ledger });
 });
 
-app.get('/api/billing-statements', requireAuth, (req, res) => {
+app.get('/api/billing-statements', (req, res) => {
   const search = String(req.query.search || '').trim();
   const dateFrom = String(req.query.date_from || '');
   const dateTo = String(req.query.date_to || '');
@@ -2180,13 +1950,13 @@ app.get('/api/billing-statements', requireAuth, (req, res) => {
   res.json({ billing_statements: statements });
 });
 
-app.get('/api/billing-statements/:id', requireAuth, (req, res) => {
+app.get('/api/billing-statements/:id', (req, res) => {
   const full = getFullBillingStatement(Number(req.params.id));
   if (!full) return res.status(404).json({ error: 'Billing statement not found.' });
   res.json({ billing_statement: full });
 });
 
-app.post('/api/billing-statements', requireAuth, (req, res) => {
+app.post('/api/billing-statements', (req, res) => {
   const idemHit = getIdempotencyHit(req, 'billing_statement');
   if (idemHit) {
     const existing = getFullBillingStatement(idemHit);
@@ -2287,7 +2057,7 @@ app.post('/api/billing-statements', requireAuth, (req, res) => {
   res.status(201).json({ billing_statement: getFullBillingStatement(createdId) });
 });
 
-app.put('/api/billing-statements/:id', requireAuth, (req, res) => {
+app.put('/api/billing-statements/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM billing_statements WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Billing statement not found.' });
@@ -2375,7 +2145,7 @@ app.put('/api/billing-statements/:id', requireAuth, (req, res) => {
   res.json({ billing_statement: getFullBillingStatement(id) });
 });
 
-app.delete('/api/billing-statements/:id', requireAuth, (req, res) => {
+app.delete('/api/billing-statements/:id', (req, res) => {
   const id = Number(req.params.id);
   const existing = db.prepare('SELECT * FROM billing_statements WHERE id = ?').get(id);
   if (!existing) return res.status(404).json({ error: 'Billing statement not found.' });
@@ -2393,7 +2163,7 @@ app.delete('/api/billing-statements/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/billing-statements/:id/pdf', requireAuth, async (req, res) => {
+app.get('/api/billing-statements/:id/pdf', async (req, res) => {
   try {
     const full = getFullBillingStatement(Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Billing statement not found.' });
@@ -2411,7 +2181,7 @@ app.get('/api/billing-statements/:id/pdf', requireAuth, async (req, res) => {
 // REPORTS & ANALYTICS MODULE
 // ============================================================================
 
-app.get('/api/reports', requireAuth, (req, res) => {
+app.get('/api/reports', (req, res) => {
   refreshTimeSensitiveStatuses();
   const dateFrom = String(req.query.date_from || '2000-01-01');
   const dateTo = String(req.query.date_to || '2099-12-31');
@@ -2529,7 +2299,7 @@ app.get('/api/reports', requireAuth, (req, res) => {
 // BACKUP, DATA EXPORT & RESTORE
 // ============================================================================
 
-app.get('/api/backup/export', requireAuth, requireOwner, (_req, res) => {
+app.get('/api/backup/export', (_req, res) => {
   const tables = [
     'business_settings',
     'document_sequences',
@@ -2579,7 +2349,7 @@ app.get('/api/backup/export', requireAuth, requireOwner, (_req, res) => {
   res.send(JSON.stringify(payload, null, 2));
 });
 
-app.post('/api/backup/import', requireAuth, requireOwner, (req, res) => {
+app.post('/api/backup/import', (req, res) => {
   const payload = req.body;
   if (!payload || !payload.tables || typeof payload.tables !== 'object') {
     return res.status(400).json({ error: 'Invalid backup file structure.' });
@@ -2675,7 +2445,7 @@ app.post('/api/backup/import', requireAuth, requireOwner, (req, res) => {
   }
 });
 
-app.get('/api/backup/export-csv/:entity', requireAuth, (req, res) => {
+app.get('/api/backup/export-csv/:entity', (req, res) => {
   const entity = req.params.entity;
   const queryMap = {
     customers: 'SELECT customer_code, customer_name, company_name, contact_number, email, billing_address, project_locations, remarks, created_at FROM customers WHERE is_archived = 0 ORDER BY id ASC',
