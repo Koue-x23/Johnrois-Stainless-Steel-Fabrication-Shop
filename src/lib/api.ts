@@ -171,6 +171,9 @@ export async function apiFetch<T = any>(
       } else if (res.status === 413) {
         errMsg =
           'Uploaded image or request exceeds the serverless payload limit (~4 MB). Please try a slightly smaller image.';
+      } else if (res.status === 504 || res.status === 502) {
+        errMsg =
+          'Server request timed out while connecting to the database. Please try saving again.';
       } else if (res.status === 404) {
         errMsg = `API endpoint not found (${url}).`;
       }

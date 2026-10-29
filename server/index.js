@@ -238,7 +238,18 @@ app.use(
       });
     }
 
-    const activeBiz = headerBiz || queryBiz;
+    let refererBiz = null;
+    if (!headerBiz && !queryBiz && req.headers.referer) {
+      try {
+        const refPath = new URL(String(req.headers.referer)).pathname;
+        const firstSeg = refPath.replace(/^\/+|\/+$/g, '').split('/').filter(Boolean)[0];
+        if (firstSeg) {
+          refererBiz = resolveBusinessIdentity(firstSeg);
+        }
+      } catch (_) {}
+    }
+
+    const activeBiz = headerBiz || queryBiz || refererBiz;
     if (!activeBiz) {
       return res.status(400).json({
         error: 'Active business workspace context (X-Business-Id) is required.',
@@ -271,10 +282,16 @@ async function assertAssetUrlBelongsToBusiness(rawUrl, businessId, label = 'Imag
   const val = String(rawUrl ?? '').trim();
   if (!val) return '';
 
+  if (/^data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(val)) {
+    return val;
+  }
+
   let pathname = val;
+  let isExternalHttp = false;
   try {
     if (/^https?:\/\//i.test(val)) {
       pathname = new URL(val).pathname;
+      isExternalHttp = true;
     }
   } catch (_) {}
 
@@ -284,11 +301,15 @@ async function assertAssetUrlBelongsToBusiness(rawUrl, businessId, label = 'Imag
     if (!urlBiz || urlBiz.id !== businessId) {
       throw new HttpError(403, `${label} belongs to a different business workspace.`);
     }
-    const fileObj = await getUploadedFile(bizScopedMatch[2], businessId);
-    if (!fileObj) {
-      throw new HttpError(400, `${label} does not exist in this business workspace.`);
+    const safeName = path.basename(bizScopedMatch[2]);
+    const existingRow = await dbGet(
+      'SELECT business_id FROM uploaded_files WHERE filename = ?',
+      [safeName]
+    );
+    if (existingRow && Number(existingRow.business_id) !== businessId) {
+      throw new HttpError(403, `${label} belongs to a different business workspace.`);
     }
-    return `/api/businesses/${urlBiz.slug}/uploads/${fileObj.filename}`;
+    return `/api/businesses/${urlBiz.slug}/uploads/${safeName}`;
   }
 
   if (pathname.startsWith('/api/uploads/files/') || pathname.startsWith('/uploads/')) {
@@ -296,10 +317,17 @@ async function assertAssetUrlBelongsToBusiness(rawUrl, businessId, label = 'Imag
       throw new HttpError(403, `${label} belongs to a different business workspace.`);
     }
     const fname = path.basename(pathname);
-    const fileObj = await getUploadedFile(fname, 1);
-    if (!fileObj) {
-      throw new HttpError(400, `${label} does not exist in this business workspace.`);
+    const existingRow = await dbGet(
+      'SELECT business_id FROM uploaded_files WHERE filename = ?',
+      [fname]
+    );
+    if (existingRow && Number(existingRow.business_id) !== 1) {
+      throw new HttpError(403, `${label} belongs to a different business workspace.`);
     }
+    return val;
+  }
+
+  if (isExternalHttp) {
     return val;
   }
 

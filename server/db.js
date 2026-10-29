@@ -137,7 +137,7 @@ export function buildPgPoolConfig(rawConnectionString, env = process.env) {
     enableChannelBinding: Boolean(needsSsl),
     max: maxConnections,
     idleTimeoutMillis: env.VERCEL ? 10000 : 30000,
-    connectionTimeoutMillis: 15000,
+    connectionTimeoutMillis: env.VERCEL ? 7000 : 15000,
     allowExitOnIdle: true,
     keepAlive: true,
   };
@@ -306,7 +306,13 @@ const BUSINESS_OWNED_TABLES = [
   'activity_logs',
 ];
 
+const SCHEMA_MIGRATION_VERSION = '2026_10_29_multi_business_v2';
+
 const SQLITE_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS businesses (
     id INTEGER PRIMARY KEY,
     slug TEXT UNIQUE NOT NULL,
@@ -937,7 +943,30 @@ async function createPostgresAdapter(connectionString) {
   return {
     type: 'postgres',
     pool,
+    handlesSeedInInit: true,
     async initSchema() {
+      // Fast-path for serverless cold starts: 1 single round-trip once migration is verified
+      try {
+        const fastCheck = await queryWithRetry(
+          `SELECT
+             (SELECT version FROM schema_migrations WHERE version = $1) AS ver,
+             (SELECT COUNT(*) FROM businesses) AS biz_cnt,
+             (SELECT COUNT(*) FROM business_settings) AS settings_cnt`,
+          [SCHEMA_MIGRATION_VERSION]
+        );
+        const fastRow = fastCheck.rows?.[0];
+        if (
+          fastRow &&
+          fastRow.ver === SCHEMA_MIGRATION_VERSION &&
+          Number(fastRow.biz_cnt) >= 2 &&
+          Number(fastRow.settings_cnt) >= 2
+        ) {
+          return;
+        }
+      } catch (_) {
+        // Proceed to full non-destructive transactional migration
+      }
+
       let client;
       try {
         client = await pool.connect();
@@ -948,64 +977,177 @@ async function createPostgresAdapter(connectionString) {
           throw err;
         }
       }
-      let locked = false;
+
+      let inTx = false;
       try {
-        await client.query('SELECT pg_advisory_lock(84729104)');
-        locked = true;
+        await client.query('BEGIN');
+        inTx = true;
 
-        for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
-          await client.query(toPostgresDdl(stmt));
-        }
+        // Transaction-scoped advisory lock (PgBouncer transaction-mode safe; auto-released on COMMIT/ROLLBACK)
+        // Batch lock acquisition + table creation + additive column migrations into 1 network round-trip
+        const ddlStatements = [
+          'SELECT pg_advisory_xact_lock(84729105)',
+          ...SQLITE_SCHEMA_STATEMENTS.map((stmt) => toPostgresDdl(stmt).trim().replace(/;$/, '')),
+          ...POSTGRES_COLUMN_MIGRATIONS.map((stmt) => stmt.trim().replace(/;$/, '')),
+        ];
+        await client.query(ddlStatements.join(';\n'));
 
-        // Remove legacy singleton CHECK (id = 1) constraint on business_settings so row id=2 (JREC) can coexist safely
-        const checkConstraints = await client.query(`
-          SELECT con.conname
+        // Inspect legacy singleton CHECK constraints & legacy single-column UNIQUE constraints/indexes in 1 round-trip
+        const targetValuesSql = BUSINESS_UNIQUE_CODE_COLUMNS.map(
+          ([tbl, col]) => `('${tbl}', '${col}')`
+        ).join(', ');
+        const legacyObjects = await client.query(`
+          WITH target_cols(tbl, col) AS (
+            VALUES ${targetValuesSql}
+          )
+          SELECT 'drop_constraint' AS kind, rel.relname AS tbl, con.conname AS obj_name
           FROM pg_constraint con
           JOIN pg_class rel ON rel.oid = con.conrelid
-          JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
-          WHERE nsp.nspname = current_schema()
+          WHERE pg_table_is_visible(rel.oid)
             AND rel.relname = 'business_settings'
             AND con.contype = 'c'
+          UNION ALL
+          SELECT 'drop_constraint' AS kind, rel.relname AS tbl, con.conname AS obj_name
+          FROM pg_constraint con
+          JOIN pg_class rel ON rel.oid = con.conrelid
+          JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = con.conkey[1]
+          JOIN target_cols tc ON tc.tbl = rel.relname AND tc.col = att.attname
+          WHERE pg_table_is_visible(rel.oid)
+            AND con.contype = 'u'
+            AND array_length(con.conkey, 1) = 1
+          UNION ALL
+          SELECT 'drop_index' AS kind, tbl_rel.relname AS tbl, idx_rel.relname AS obj_name
+          FROM pg_index idx
+          JOIN pg_class tbl_rel ON tbl_rel.oid = idx.indrelid
+          JOIN pg_class idx_rel ON idx_rel.oid = idx.indexrelid
+          JOIN pg_attribute att ON att.attrelid = tbl_rel.oid AND att.attnum = idx.indkey[0]
+          JOIN target_cols tc ON tc.tbl = tbl_rel.relname AND tc.col = att.attname
+          LEFT JOIN pg_constraint con ON con.conindid = idx.indexrelid
+          WHERE pg_table_is_visible(tbl_rel.oid)
+            AND idx.indisunique = true
+            AND idx.indisprimary = false
+            AND idx.indnatts = 1
+            AND con.oid IS NULL
         `);
-        for (const row of checkConstraints.rows) {
-          const safeConName = String(row.conname).replace(/"/g, '""');
-          await client.query(`ALTER TABLE business_settings DROP CONSTRAINT IF EXISTS "${safeConName}"`);
-        }
 
-        for (const alterStmt of POSTGRES_COLUMN_MIGRATIONS) {
-          await client.query(alterStmt);
-        }
-
-        // Replace legacy single-column UNIQUE constraints on code/number columns with composite (business_id, <col>) unique indexes
-        for (const [tbl, col] of BUSINESS_UNIQUE_CODE_COLUMNS) {
-          const singleUniqueRows = await client.query(
-            `SELECT con.conname
-             FROM pg_constraint con
-             JOIN pg_class rel ON rel.oid = con.conrelid
-             JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
-             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = con.conkey[1]
-             WHERE nsp.nspname = current_schema()
-               AND rel.relname = $1
-               AND con.contype = 'u'
-               AND array_length(con.conkey, 1) = 1
-               AND att.attname = $2`,
-            [tbl, col]
-          );
-          for (const uRow of singleUniqueRows.rows) {
-            const safeConName = String(uRow.conname).replace(/"/g, '""');
-            await client.query(`ALTER TABLE ${tbl} DROP CONSTRAINT IF EXISTS "${safeConName}"`);
+        const dropStatements = [];
+        for (const row of legacyObjects.rows) {
+          const safeTbl = String(row.tbl).replace(/"/g, '""');
+          const safeObj = String(row.obj_name).replace(/"/g, '""');
+          if (row.kind === 'drop_constraint') {
+            dropStatements.push(`ALTER TABLE "${safeTbl}" DROP CONSTRAINT IF EXISTS "${safeObj}"`);
+          } else if (row.kind === 'drop_index') {
+            dropStatements.push(`DROP INDEX IF EXISTS "${safeObj}"`);
           }
         }
 
-        for (const idxStmt of POST_MIGRATION_INDEXES) {
-          await client.query(idxStmt);
+        const safeNow = nowISO().replace(/'/g, "''");
+        const safeVer = SCHEMA_MIGRATION_VERSION.replace(/'/g, "''");
+
+        const seedAndNormalizeStatements = [
+          ...BUSINESS_DEFINITIONS.map((biz) => {
+            const safeSlug = biz.slug.replace(/'/g, "''");
+            const safeName = biz.default_name.replace(/'/g, "''");
+            const safeShort = biz.short_code.replace(/'/g, "''");
+            return `INSERT INTO businesses (id, slug, default_name, short_code, created_at)
+              VALUES (${Number(biz.id)}, '${safeSlug}', '${safeName}', '${safeShort}', '${safeNow}')
+              ON CONFLICT (id) DO NOTHING`;
+          }),
+          `INSERT INTO business_settings (
+            id, business_id, business_name, logo_url, address, contact_number, email,
+            facebook_url, maps_url, other_social_links, operating_hours,
+            default_payment_terms, updated_at
+          ) VALUES (
+            1,
+            1,
+            'John Rois Stainless Steel Fabrication Shop',
+            '',
+            'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
+            '+63 917 421 7417',
+            '',
+            'https://www.facebook.com/johnroiscanon',
+            'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
+            '',
+            'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
+            '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+            '${safeNow}'
+          ) ON CONFLICT (id) DO NOTHING`,
+          `UPDATE business_settings
+           SET business_name = 'John Rois Stainless Steel Fabrication Shop',
+               business_id = 1
+           WHERE id = 1 AND business_name = 'Johnrois Stainless Steel Fabrication Shop'`,
+          `UPDATE business_settings SET business_id = 1 WHERE id = 1 AND (business_id IS NULL OR business_id != 1)`,
+          `INSERT INTO business_settings (
+            id, business_id, business_name, logo_url, address, contact_number, email,
+            facebook_url, maps_url, other_social_links, operating_hours,
+            default_payment_terms, updated_at
+          ) VALUES (
+            2,
+            2,
+            'JREC Stainless Steel Fabrication',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '',
+            '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+            '${safeNow}'
+          ) ON CONFLICT (id) DO NOTHING`,
+          `UPDATE business_settings SET business_id = 2 WHERE id = 2 AND (business_id IS NULL OR business_id != 2)`,
+          // Safely preserve any legacy rows with null/out-of-range business_id by assigning them to Business 1 (John Rois)
+          ...BUSINESS_OWNED_TABLES.map(
+            (tbl) =>
+              `UPDATE ${tbl} SET business_id = 1 WHERE business_id IS NULL OR business_id NOT IN (1, 2)`
+          ),
+          // Conflict-free merge of pre-existing unprefixed document_sequences into BIZ1:* without 23505 PK collisions
+          `INSERT INTO document_sequences (seq_key, business_id, last_val)
+           SELECT 'BIZ1:' || seq_key, 1, last_val
+           FROM document_sequences
+           WHERE seq_key NOT ILIKE 'BIZ%'
+           ON CONFLICT (seq_key) DO UPDATE
+             SET last_val = GREATEST(document_sequences.last_val, EXCLUDED.last_val),
+                 business_id = 1`,
+          `DELETE FROM document_sequences WHERE seq_key NOT ILIKE 'BIZ%'`,
+          `UPDATE uploaded_files
+           SET storage_path = 'john-rois/' || filename
+           WHERE business_id = 1 AND (storage_path IS NULL OR storage_path = '')`,
+          `INSERT INTO schema_migrations (version, applied_at)
+           VALUES ('${safeVer}', '${safeNow}')
+           ON CONFLICT (version) DO UPDATE SET applied_at = EXCLUDED.applied_at`,
+        ];
+
+        const phase2Statements = [
+          ...dropStatements,
+          ...POST_MIGRATION_INDEXES.map((s) => s.trim().replace(/;$/, '')),
+          ...seedAndNormalizeStatements,
+        ];
+        await client.query(phase2Statements.join(';\n'));
+
+        const verifyRes = await client.query(
+          `SELECT
+             (SELECT COUNT(*) FROM businesses) AS biz_cnt,
+             (SELECT COUNT(*) FROM business_settings) AS settings_cnt`
+        );
+        const vRow = verifyRes.rows?.[0];
+        if (!vRow || Number(vRow.biz_cnt) < 2 || Number(vRow.settings_cnt) < 2) {
+          throw new Error(
+            'Multi-business migration verification failed: expected 2 seeded businesses and settings.'
+          );
         }
-      } finally {
-        if (locked) {
+
+        await client.query('COMMIT');
+        inTx = false;
+      } catch (err) {
+        if (inTx) {
           try {
-            await client.query('SELECT pg_advisory_unlock(84729104)');
+            await client.query('ROLLBACK');
           } catch (_) {}
         }
+        throw err;
+      } finally {
         client.release();
       }
     },
@@ -1353,37 +1495,45 @@ async function seedAndVerifyMultiBusinessData(ad) {
   );
   await ad.run('UPDATE business_settings SET business_id = 2 WHERE id = 2 AND business_id != 2');
 
-  // 4. Namespace any pre-existing John Rois document_sequences keys under BIZ1: so JREC sequences start cleanly at 1
-  await ad.run(
-    `UPDATE document_sequences
-     SET seq_key = 'BIZ1:' || seq_key,
-         business_id = 1
-     WHERE seq_key NOT LIKE 'BIZ%'`
-  );
+  // 4. Safely preserve any legacy rows with null/out-of-range business_id by assigning them to Business 1
+  for (const tbl of BUSINESS_OWNED_TABLES) {
+    await ad.run(
+      `UPDATE ${tbl} SET business_id = 1 WHERE business_id IS NULL OR business_id NOT IN (1, 2)`
+    );
+  }
 
-  // 5. Namespace legacy John Rois uploaded_files storage_path metadata without altering existing filenames
+  // 5. Conflict-free merge of pre-existing unprefixed document_sequences keys under BIZ1:
+  const maxFn = ad.type === 'postgres' ? 'GREATEST' : 'MAX';
+  await ad.run(
+    `INSERT INTO document_sequences (seq_key, business_id, last_val)
+     SELECT 'BIZ1:' || seq_key, 1, last_val
+     FROM document_sequences
+     WHERE seq_key NOT LIKE 'BIZ%'
+     ON CONFLICT (seq_key) DO UPDATE
+       SET last_val = ${maxFn}(document_sequences.last_val, EXCLUDED.last_val),
+           business_id = 1`
+  );
+  await ad.run(`DELETE FROM document_sequences WHERE seq_key NOT LIKE 'BIZ%'`);
+
+  // 6. Namespace legacy John Rois uploaded_files storage_path metadata without altering existing filenames
   await ad.run(
     `UPDATE uploaded_files
      SET storage_path = 'john-rois/' || filename
      WHERE business_id = 1 AND (storage_path IS NULL OR storage_path = '')`
   );
 
-  // 6. Verify migration integrity: ensure both businesses & settings exist and no orphan business_id values exist
+  await ad.run(
+    `INSERT INTO schema_migrations (version, applied_at)
+     VALUES (?, ?)
+     ON CONFLICT (version) DO UPDATE SET applied_at = EXCLUDED.applied_at`,
+    [SCHEMA_MIGRATION_VERSION, now]
+  );
+
+  // 7. Verify migration integrity: ensure both businesses & settings exist
   const bizRows = await ad.all('SELECT id, slug FROM businesses ORDER BY id ASC');
   const settingsRows = await ad.all('SELECT id, business_id FROM business_settings ORDER BY id ASC');
   if (bizRows.length < 2 || settingsRows.length < 2) {
     throw new Error('Multi-business migration verification failed: expected 2 seeded businesses and settings.');
-  }
-
-  for (const tbl of BUSINESS_OWNED_TABLES) {
-    const invalidRow = await ad.get(
-      `SELECT COUNT(*) as cnt FROM ${tbl} WHERE business_id IS NULL OR business_id NOT IN (1, 2)`
-    );
-    if (Number(invalidRow?.cnt || 0) > 0) {
-      throw new Error(
-        `Multi-business migration verification failed: table ${tbl} has ${invalidRow.cnt} row(s) with invalid business_id.`
-      );
-    }
   }
 }
 
@@ -1457,7 +1607,9 @@ export async function ensureDbReady() {
     }
 
     await candidateAdapter.initSchema();
-    await seedAndVerifyMultiBusinessData(candidateAdapter);
+    if (!candidateAdapter.handlesSeedInInit) {
+      await seedAndVerifyMultiBusinessData(candidateAdapter);
+    }
     nextStatus.migration_verified = true;
 
     adapter = candidateAdapter;

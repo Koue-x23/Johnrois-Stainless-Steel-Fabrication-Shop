@@ -958,8 +958,13 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     setActiveBusinessSlug(route.businessSlug);
-    if (!route.businessSlug && typeof document !== 'undefined') {
-      document.title = 'Welcome — Multi-Business Management Workspace';
+    if (!route.businessSlug) {
+      if (typeof document !== 'undefined') {
+        document.title = 'Welcome — Multi-Business Management Workspace';
+      }
+      if (typeof window !== 'undefined' && window.location.pathname !== '/') {
+        window.history.replaceState({}, '', '/');
+      }
     }
   }, [route.businessSlug]);
 
