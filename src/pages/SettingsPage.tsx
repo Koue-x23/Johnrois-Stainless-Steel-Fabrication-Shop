@@ -8,10 +8,11 @@ import {
   Info,
   CheckCircle2,
 } from 'lucide-react';
-import { BusinessSettings } from '../types';
+import { BusinessSettings, BusinessSlug } from '../types';
 import {
   apiFetch,
   downloadAuthenticatedFile,
+  getBusinessMonogram,
   resolveAssetUrl,
   todayYMD,
   uploadImageFile,
@@ -19,17 +20,20 @@ import {
 import { SignaturePadModal } from '../components/SignaturePadModal';
 
 interface SettingsPageProps {
+  businessSlug: BusinessSlug;
   settings: BusinessSettings;
   onSettingsUpdated: (s: BusinessSettings) => void;
 }
 
 export const SettingsPage: React.FC<SettingsPageProps> = ({
+  businessSlug,
   settings,
   onSettingsUpdated,
 }) => {
   const [tab, setTab] = useState<'business' | 'backup'>('business');
 
   const [form, setForm] = useState<BusinessSettings>(settings);
+  const [logoBroken, setLogoBroken] = useState(false);
   const [saving, setSaving] = useState(false);
   const [uploadingLogo, setUploadingLogo] = useState(false);
   const [sigModalOpen, setSigModalOpen] = useState(false);
@@ -38,6 +42,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 
   useEffect(() => {
     setForm(settings);
+    setLogoBroken(false);
   }, [settings]);
 
   const persistSettingsSnapshot = async (
@@ -116,7 +121,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
     if (!file) return;
     if (
       !window.confirm(
-        'Restoring a backup will replace current records with the backup file data. Continue?'
+        `Restoring a backup will replace current records inside ${settings.business_name} only (the other business workspace will not be affected). Continue?`
       )
     ) {
       e.target.value = '';
@@ -133,7 +138,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
       });
       const latest = await apiFetch<{ settings: BusinessSettings }>('/api/settings');
       onSettingsUpdated(latest.settings);
-      setNotice('Database backup restored cleanly.');
+      setNotice(`Workspace backup restored cleanly for ${latest.settings.business_name}.`);
     } catch (err: any) {
       setError(err.message || 'Invalid backup file.');
     } finally {
@@ -214,10 +219,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
         <form onSubmit={handleSaveBusiness} className="space-y-5">
           <div className="p-3.5 rounded-md bg-sky-50 border border-sky-200 text-xs text-sky-950 flex items-start gap-2.5">
             <Info className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
-            <div>
-              <strong>Verified Information Policy:</strong> Publicly indexed details linked to{' '}
-              <span className="font-mono">facebook.com/johnroiscanon</span> (Business Name, Brgy. Ubalde Davao City location, Google Maps link, and listed mobile number) are pre-populated below. Unverified fields—such as official Logo image, Email address, Authorized Representative name, Signature, and Tax settings—have been intentionally left blank for the owner to supply. No legal or tax numbers have been invented.
-            </div>
+            {businessSlug === 'john-rois' ? (
+              <div>
+                <strong>Independent Workspace Profile (John Rois):</strong> Publicly indexed details linked to{' '}
+                <span className="font-mono">facebook.com/johnroiscanon</span> (Business Name, Brgy. Ubalde Davao City location, Google Maps link, and listed mobile number) are pre-populated below. Changes saved here apply exclusively to <strong>{form.business_name || 'John Rois Stainless Steel Fabrication Shop'}</strong> and its Welcome Screen card.
+              </div>
+            ) : (
+              <div>
+                <strong>Independent Workspace Profile (JREC):</strong> Configure the official logo, contact details, social links, signatory, and document prefixes exclusively for <strong>{form.business_name || 'JREC Stainless Steel Fabrication'}</strong>. No unverified address, phone, or tax details have been pre-filled, and settings saved here never affect John Rois Stainless Steel Fabrication Shop.
+              </div>
+            )}
           </div>
 
           <div className="bg-white border border-slate-200 rounded-md p-5 space-y-5">
@@ -227,17 +238,24 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
 
             {/* Logo Upload */}
             <div className="flex flex-wrap items-center gap-5">
-              <div className="w-20 h-20 rounded border border-slate-300 bg-slate-50 flex items-center justify-center overflow-hidden">
-                {form.logo_url ? (
+              <div className="w-20 h-20 rounded-lg border border-slate-300 bg-slate-50 flex items-center justify-center overflow-hidden p-1.5">
+                {form.logo_url && !logoBroken ? (
                   <img
                     src={resolveAssetUrl(form.logo_url)}
-                    alt="Business Logo"
+                    alt={`${form.business_name} Logo`}
+                    onError={() => setLogoBroken(true)}
                     className="w-full h-full object-contain"
                   />
                 ) : (
-                  <span className="text-xs font-bold text-slate-400 text-center px-1">
-                    No Logo
-                  </span>
+                  <div className="flex flex-col items-center justify-center text-center">
+                    <span className="text-xs font-extrabold text-sky-700">
+                      {getBusinessMonogram(
+                        form.business_name,
+                        businessSlug === 'jrec' ? 'JREC' : 'JR'
+                      )}
+                    </span>
+                    <span className="text-[10px] font-medium text-slate-400">No Logo</span>
+                  </div>
                 )}
               </div>
               <div className="space-y-1.5">
@@ -666,7 +684,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                 try {
                   await downloadAuthenticatedFile(
                     '/api/backup/export',
-                    `johnrois-backup-${todayYMD()}.json`
+                    `${businessSlug}-backup-${todayYMD()}.json`
                   );
                 } catch (err: any) {
                   setError(err.message || 'Failed to download backup file.');

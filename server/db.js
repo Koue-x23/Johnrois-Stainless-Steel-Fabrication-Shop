@@ -10,6 +10,39 @@ export const ROOT_DIR = path.resolve(__dirname, '..');
 const IS_VERCEL = Boolean(process.env.VERCEL);
 const CUSTOM_SQLITE_PATH = (process.env.SQLITE_DB_PATH || '').trim();
 
+// ============================================================================
+// CANONICAL MULTI-BUSINESS TENANT REGISTRY
+// ============================================================================
+
+export const BUSINESS_DEFINITIONS = [
+  {
+    id: 1,
+    slug: 'john-rois',
+    aliases: ['1', 'john-rois', 'johnrois'],
+    default_name: 'John Rois Stainless Steel Fabrication Shop',
+    short_code: 'JR',
+  },
+  {
+    id: 2,
+    slug: 'jrec',
+    aliases: ['2', 'jrec'],
+    default_name: 'JREC Stainless Steel Fabrication',
+    short_code: 'JREC',
+  },
+];
+
+export function resolveBusinessIdentity(rawInput) {
+  if (rawInput === null || rawInput === undefined) return null;
+  const normalized = String(rawInput).trim().toLowerCase();
+  if (!normalized) return null;
+  for (const biz of BUSINESS_DEFINITIONS) {
+    if (biz.aliases.includes(normalized)) {
+      return biz;
+    }
+  }
+  return null;
+}
+
 const EXPLICIT_POSTGRES_ENV_KEYS = [
   'DATABASE_URL',
   'POSTGRES_URL',
@@ -32,7 +65,6 @@ export function resolvePostgresConnection(env = process.env) {
     }
   }
 
-  // Support custom-prefixed Vercel Marketplace Neon / Postgres variables (e.g. STORAGE_DATABASE_URL, JOHNROIS_DATABASE_URL)
   for (const [key, rawVal] of Object.entries(env)) {
     if (
       /(?:^|_)(?:DATABASE_URL|POSTGRES_URL|POSTGRES_PRISMA_URL|DATABASE_URL_UNPOOLED|POSTGRES_URL_NON_POOLING)$/i.test(
@@ -50,7 +82,6 @@ export function resolvePostgresConnection(env = process.env) {
     }
   }
 
-  // Support discrete PGHOST / POSTGRES_HOST variables if URL is not provided directly
   const host = (env.PGHOST || env.POSTGRES_HOST || '').trim();
   const user = (env.PGUSER || env.POSTGRES_USER || '').trim();
   const password = env.PGPASSWORD || env.POSTGRES_PASSWORD || '';
@@ -87,17 +118,12 @@ export function buildPgPoolConfig(rawConnectionString, env = process.env) {
       needsSsl = !isLocalHost;
     }
 
-    // Strip sslmode / ssl / channel_binding query parameters from connectionString so
-    // pg-connection-string inside new pg.Client(pool.options) does NOT overwrite `ssl`
-    // or emit deprecation warnings on serverless cold starts.
     parsed.searchParams.delete('sslmode');
     parsed.searchParams.delete('ssl');
     parsed.searchParams.delete('uselibpqcompat');
     parsed.searchParams.delete('channel_binding');
     cleanUrl = parsed.toString();
-  } catch (_) {
-    // Fallback to raw URL if URL constructor cannot parse non-standard DSN
-  }
+  } catch (_) {}
 
   const maxConnections = env.PG_POOL_MAX
     ? Math.max(1, Number(env.PG_POOL_MAX) || 3)
@@ -108,7 +134,6 @@ export function buildPgPoolConfig(rawConnectionString, env = process.env) {
   return {
     connectionString: cleanUrl,
     ssl: needsSsl ? { rejectUnauthorized: false } : false,
-    // Enable SCRAM-SHA-256-PLUS channel binding when offered by Neon over TLS
     enableChannelBinding: Boolean(needsSsl),
     max: maxConnections,
     idleTimeoutMillis: env.VERCEL ? 10000 : 30000,
@@ -150,6 +175,7 @@ let storageStatus = {
   persistent: false,
   is_serverless: IS_VERCEL,
   setup_required: false,
+  migration_verified: false,
   message: '',
 };
 
@@ -158,7 +184,8 @@ export function getStorageStatus() {
 }
 
 export function round2(val) {
-  const num = Number(val) || 0;
+  const num = Number(val);
+  if (!Number.isFinite(num)) return 0;
   return Math.round((num + Number.EPSILON) * 100) / 100;
 }
 
@@ -167,7 +194,11 @@ export function nowISO() {
 }
 
 export function todayYMD() {
-  return new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
 // ============================================================================
@@ -220,7 +251,6 @@ function translateSqlForPostgres(sql, wantReturningId = false) {
     }
   }
 
-  // Case-insensitive LIKE in PostgreSQL to match SQLite's default ASCII LIKE behavior
   out = out.replace(/\bLIKE\b/gi, 'ILIKE');
 
   if (wantReturningId) {
@@ -240,10 +270,50 @@ function translateSqlForPostgres(sql, wantReturningId = false) {
 }
 
 // ============================================================================
-// SCHEMA DEFINITIONS (SQLITE/LIBSQL & POSTGRESQL)
+// SCHEMA DEFINITIONS (MULTI-BUSINESS ISOLATED)
 // ============================================================================
 
+const BUSINESS_UNIQUE_CODE_COLUMNS = [
+  ['customers', 'customer_code'],
+  ['products_services', 'item_code'],
+  ['quotations', 'quotation_number'],
+  ['invoices', 'invoice_number'],
+  ['payments', 'payment_number'],
+  ['service_reports', 'report_number'],
+  ['billing_statements', 'statement_number'],
+  ['employees', 'employee_code'],
+  ['payslips', 'payslip_number'],
+  ['certificates_of_employment', 'certificate_number'],
+  ['employee_id_cards', 'card_number'],
+];
+
+const BUSINESS_OWNED_TABLES = [
+  'business_settings',
+  'document_sequences',
+  'idempotency_keys',
+  'uploaded_files',
+  'customers',
+  'products_services',
+  'quotations',
+  'invoices',
+  'payments',
+  'service_reports',
+  'billing_statements',
+  'employees',
+  'payslips',
+  'certificates_of_employment',
+  'employee_id_cards',
+  'activity_logs',
+];
+
 const SQLITE_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS businesses (
+    id INTEGER PRIMARY KEY,
+    slug TEXT UNIQUE NOT NULL,
+    default_name TEXT NOT NULL,
+    short_code TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL COLLATE NOCASE,
@@ -264,16 +334,17 @@ const SQLITE_SCHEMA_STATEMENTS = [
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS business_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    business_name TEXT NOT NULL DEFAULT 'Johnrois Stainless Steel Fabrication Shop',
+    id INTEGER PRIMARY KEY,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    business_name TEXT NOT NULL DEFAULT 'John Rois Stainless Steel Fabrication Shop',
     logo_url TEXT NOT NULL DEFAULT '',
-    address TEXT NOT NULL DEFAULT 'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
-    contact_number TEXT NOT NULL DEFAULT '+63 917 421 7417',
+    address TEXT NOT NULL DEFAULT '',
+    contact_number TEXT NOT NULL DEFAULT '',
     email TEXT NOT NULL DEFAULT '',
-    facebook_url TEXT NOT NULL DEFAULT 'https://www.facebook.com/johnroiscanon',
-    maps_url TEXT NOT NULL DEFAULT 'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
+    facebook_url TEXT NOT NULL DEFAULT '',
+    maps_url TEXT NOT NULL DEFAULT '',
     other_social_links TEXT NOT NULL DEFAULT '',
-    operating_hours TEXT NOT NULL DEFAULT 'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
+    operating_hours TEXT NOT NULL DEFAULT '',
     quotation_prefix TEXT NOT NULL DEFAULT 'QTN',
     invoice_prefix TEXT NOT NULL DEFAULT 'INV',
     service_report_prefix TEXT NOT NULL DEFAULT 'SR',
@@ -301,16 +372,20 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS document_sequences (
     seq_key TEXT PRIMARY KEY,
+    business_id INTEGER NOT NULL DEFAULT 1,
     last_val INTEGER NOT NULL DEFAULT 0
   )`,
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
     idem_key TEXT PRIMARY KEY,
+    business_id INTEGER NOT NULL DEFAULT 1,
     entity_type TEXT NOT NULL,
     entity_id INTEGER NOT NULL,
     created_at TEXT NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS uploaded_files (
     filename TEXT PRIMARY KEY,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    storage_path TEXT NOT NULL DEFAULT '',
     mime_type TEXT NOT NULL,
     byte_size INTEGER NOT NULL,
     data_base64 TEXT NOT NULL,
@@ -318,7 +393,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS customers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_code TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    customer_code TEXT NOT NULL,
     customer_name TEXT NOT NULL,
     company_name TEXT NOT NULL DEFAULT '',
     contact_number TEXT NOT NULL DEFAULT '',
@@ -329,11 +405,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, customer_code)
   )`,
   `CREATE TABLE IF NOT EXISTS products_services (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_code TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    item_code TEXT NOT NULL,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     category TEXT NOT NULL DEFAULT 'Fabrication',
@@ -342,11 +420,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     unit_price REAL NOT NULL DEFAULT 0,
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, item_code)
   )`,
   `CREATE TABLE IF NOT EXISTS quotations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    quotation_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    quotation_number TEXT NOT NULL,
     date_issued TEXT NOT NULL,
     valid_until TEXT NOT NULL DEFAULT '',
     customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
@@ -376,7 +456,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, quotation_number)
   )`,
   `CREATE TABLE IF NOT EXISTS quotation_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -391,7 +472,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS invoices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    invoice_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    invoice_number TEXT NOT NULL,
     invoice_date TEXT NOT NULL,
     due_date TEXT NOT NULL DEFAULT '',
     customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
@@ -424,7 +506,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, invoice_number)
   )`,
   `CREATE TABLE IF NOT EXISTS invoice_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,7 +522,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    payment_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    payment_number TEXT NOT NULL,
     invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
     customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
     payment_date TEXT NOT NULL,
@@ -449,11 +533,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     notes TEXT NOT NULL DEFAULT '',
     recorded_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, payment_number)
   )`,
   `CREATE TABLE IF NOT EXISTS service_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    report_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    report_number TEXT NOT NULL,
     service_date TEXT NOT NULL,
     job_type TEXT NOT NULL DEFAULT 'Fabrication',
     customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
@@ -480,7 +566,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, report_number)
   )`,
   `CREATE TABLE IF NOT EXISTS service_report_materials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -502,7 +589,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS billing_statements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    statement_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    statement_number TEXT NOT NULL,
     statement_date TEXT NOT NULL,
     period_from TEXT NOT NULL,
     period_to TEXT NOT NULL,
@@ -523,7 +611,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, statement_number)
   )`,
   `CREATE TABLE IF NOT EXISTS billing_statement_lines (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -542,6 +631,7 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS activity_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL DEFAULT 1,
     entity_type TEXT NOT NULL,
     entity_id INTEGER,
     document_number TEXT NOT NULL DEFAULT '',
@@ -555,7 +645,8 @@ const SQLITE_SCHEMA_STATEMENTS = [
   )`,
   `CREATE TABLE IF NOT EXISTS employees (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    employee_code TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    employee_code TEXT NOT NULL,
     full_name TEXT NOT NULL,
     position_title TEXT NOT NULL,
     department TEXT NOT NULL DEFAULT '',
@@ -574,11 +665,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     notes TEXT NOT NULL DEFAULT '',
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, employee_code)
   )`,
   `CREATE TABLE IF NOT EXISTS payslips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    payslip_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    payslip_number TEXT NOT NULL,
     employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     employee_code TEXT NOT NULL,
     employee_name TEXT NOT NULL,
@@ -617,11 +710,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     status TEXT NOT NULL DEFAULT 'Issued' CHECK(status IN ('Draft', 'Issued', 'Paid')),
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, payslip_number)
   )`,
   `CREATE TABLE IF NOT EXISTS certificates_of_employment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    certificate_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    certificate_number TEXT NOT NULL,
     employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     employee_code TEXT NOT NULL DEFAULT '',
     employee_name TEXT NOT NULL,
@@ -643,11 +738,13 @@ const SQLITE_SCHEMA_STATEMENTS = [
     remarks TEXT NOT NULL DEFAULT '',
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, certificate_number)
   )`,
   `CREATE TABLE IF NOT EXISTS employee_id_cards (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    card_number TEXT UNIQUE NOT NULL,
+    business_id INTEGER NOT NULL DEFAULT 1,
+    card_number TEXT NOT NULL,
     employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
     employee_code TEXT NOT NULL,
     full_name TEXT NOT NULL,
@@ -668,22 +765,9 @@ const SQLITE_SCHEMA_STATEMENTS = [
     status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active', 'Expired', 'Revoked')),
     is_archived INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(business_id, card_number)
   )`,
-  `CREATE INDEX IF NOT EXISTS idx_quotations_customer ON quotations(customer_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_quotations_status ON quotations(status)`,
-  `CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`,
-  `CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_service_reports_customer ON service_reports(customer_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_billing_statements_customer ON billing_statements(customer_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(is_active)`,
-  `CREATE INDEX IF NOT EXISTS idx_payslips_employee ON payslips(employee_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_payslips_period ON payslips(pay_period_start, pay_period_end)`,
-  `CREATE INDEX IF NOT EXISTS idx_coe_employee ON certificates_of_employment(employee_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_id_cards_employee ON employee_id_cards(employee_id)`,
-  `CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at DESC)`,
 ];
 
 function toPostgresDdl(sqliteStmt) {
@@ -694,10 +778,11 @@ function toPostgresDdl(sqliteStmt) {
 }
 
 // ============================================================================
-// ADAPTER INITIALIZERS
+// SAFE NON-DESTRUCTIVE MIGRATIONS FOR EXISTING PRODUCTION DATABASES
 // ============================================================================
 
 const POSTGRES_COLUMN_MIGRATIONS = [
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS logo_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS signature_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS other_social_links TEXT NOT NULL DEFAULT ''",
@@ -711,28 +796,99 @@ const POSTGRES_COLUMN_MIGRATIONS = [
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS payslip_prefix TEXT NOT NULL DEFAULT 'PSL'",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS coe_prefix TEXT NOT NULL DEFAULT 'COE'",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS id_card_prefix TEXT NOT NULL DEFAULT 'IDC'",
+  "ALTER TABLE document_sequences ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE uploaded_files ADD COLUMN IF NOT EXISTS storage_path TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE customers ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE customers ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE products_services ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE products_services ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS converted_invoice_id INTEGER DEFAULT NULL",
   "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE invoices ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE payments ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS technician_signature_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS customer_signature_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE billing_statements ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE billing_statements ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE employees ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_active INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE payslips ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE certificates_of_employment ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE employee_id_cards ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE activity_logs ADD COLUMN IF NOT EXISTS business_id INTEGER NOT NULL DEFAULT 1",
+];
+
+const POST_MIGRATION_INDEXES = [
+  'CREATE INDEX IF NOT EXISTS idx_quotations_customer ON quotations(customer_id)',
+  'CREATE INDEX IF NOT EXISTS idx_quotations_status ON quotations(status)',
+  'CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id)',
+  'CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)',
+  'CREATE INDEX IF NOT EXISTS idx_payments_invoice ON payments(invoice_id)',
+  'CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id)',
+  'CREATE INDEX IF NOT EXISTS idx_service_reports_customer ON service_reports(customer_id)',
+  'CREATE INDEX IF NOT EXISTS idx_billing_statements_customer ON billing_statements(customer_id)',
+  'CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(is_active)',
+  'CREATE INDEX IF NOT EXISTS idx_payslips_employee ON payslips(employee_id)',
+  'CREATE INDEX IF NOT EXISTS idx_payslips_period ON payslips(pay_period_start, pay_period_end)',
+  'CREATE INDEX IF NOT EXISTS idx_coe_employee ON certificates_of_employment(employee_id)',
+  'CREATE INDEX IF NOT EXISTS idx_id_cards_employee ON employee_id_cards(employee_id)',
+  'CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at DESC)',
+  'CREATE INDEX IF NOT EXISTS idx_customers_business ON customers(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_products_business ON products_services(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_quotations_business ON quotations(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_invoices_business ON invoices(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_payments_business ON payments(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_service_reports_business ON service_reports(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_billing_statements_business ON billing_statements(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_employees_business ON employees(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_payslips_business ON payslips(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_coe_business ON certificates_of_employment(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_id_cards_business ON employee_id_cards(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_activity_logs_business ON activity_logs(business_id)',
+  'CREATE INDEX IF NOT EXISTS idx_uploaded_files_business ON uploaded_files(business_id)',
+  ...BUSINESS_UNIQUE_CODE_COLUMNS.map(
+    ([tbl, col]) => `CREATE UNIQUE INDEX IF NOT EXISTS uidx_${tbl}_biz_${col} ON ${tbl}(business_id, ${col})`
+  ),
 ];
 
 const SQLITE_COLUMN_MIGRATIONS = [
+  "ALTER TABLE business_settings ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
   "ALTER TABLE business_settings ADD COLUMN employee_prefix TEXT NOT NULL DEFAULT 'EMP'",
   "ALTER TABLE business_settings ADD COLUMN payslip_prefix TEXT NOT NULL DEFAULT 'PSL'",
   "ALTER TABLE business_settings ADD COLUMN coe_prefix TEXT NOT NULL DEFAULT 'COE'",
   "ALTER TABLE business_settings ADD COLUMN id_card_prefix TEXT NOT NULL DEFAULT 'IDC'",
+  "ALTER TABLE document_sequences ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE idempotency_keys ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE uploaded_files ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE uploaded_files ADD COLUMN storage_path TEXT NOT NULL DEFAULT ''",
+  "ALTER TABLE customers ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE products_services ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE quotations ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE invoices ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE payments ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE service_reports ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE billing_statements ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE employees ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE payslips ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE certificates_of_employment ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE employee_id_cards ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
+  "ALTER TABLE activity_logs ADD COLUMN business_id INTEGER NOT NULL DEFAULT 1",
 ];
 
 function isTransientPostgresError(err) {
   if (!err) return false;
   const code = String(err.code || '');
-  if (['57P01', '57P02', '57P03', '08000', '08003', '08006', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(code)) {
+  if (
+    ['57P01', '57P02', '57P03', '08000', '08003', '08006', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE'].includes(
+      code
+    )
+  ) {
     return true;
   }
   const msg = String(err.message || '');
@@ -752,19 +908,15 @@ function normalizePostgresParams(params = []) {
 async function createPostgresAdapter(connectionString) {
   const pgMod = await import('pg');
   const pg = pgMod.default || pgMod;
-  // Parse BIGINT (OID 20) & NUMERIC (OID 1700) as JS numbers to match SQLite semantics
   pg.types.setTypeParser(20, (val) => (val === null ? null : Number(val)));
   pg.types.setTypeParser(1700, (val) => (val === null ? null : Number(val)));
 
   const poolConfig = buildPgPoolConfig(connectionString);
   const pool = new pg.Pool(poolConfig);
 
-  // Prevent Neon scale-to-zero / idle PgBouncer disconnects from crashing the serverless process
   pool.on('error', (err) => {
     console.warn('[db:postgres] Idle pooled connection closed:', err?.message || err);
   });
-
-  const getExecutor = () => txContext.getStore() || pool;
 
   const queryWithRetry = async (pgSql, rawParams = []) => {
     const cleanParams = normalizePostgresParams(rawParams);
@@ -798,14 +950,55 @@ async function createPostgresAdapter(connectionString) {
       }
       let locked = false;
       try {
-        // Serialize concurrent Vercel cold-start schema migrations against Neon
         await client.query('SELECT pg_advisory_lock(84729104)');
         locked = true;
+
         for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
           await client.query(toPostgresDdl(stmt));
         }
+
+        // Remove legacy singleton CHECK (id = 1) constraint on business_settings so row id=2 (JREC) can coexist safely
+        const checkConstraints = await client.query(`
+          SELECT con.conname
+          FROM pg_constraint con
+          JOIN pg_class rel ON rel.oid = con.conrelid
+          JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+          WHERE nsp.nspname = current_schema()
+            AND rel.relname = 'business_settings'
+            AND con.contype = 'c'
+        `);
+        for (const row of checkConstraints.rows) {
+          const safeConName = String(row.conname).replace(/"/g, '""');
+          await client.query(`ALTER TABLE business_settings DROP CONSTRAINT IF EXISTS "${safeConName}"`);
+        }
+
         for (const alterStmt of POSTGRES_COLUMN_MIGRATIONS) {
           await client.query(alterStmt);
+        }
+
+        // Replace legacy single-column UNIQUE constraints on code/number columns with composite (business_id, <col>) unique indexes
+        for (const [tbl, col] of BUSINESS_UNIQUE_CODE_COLUMNS) {
+          const singleUniqueRows = await client.query(
+            `SELECT con.conname
+             FROM pg_constraint con
+             JOIN pg_class rel ON rel.oid = con.conrelid
+             JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attnum = con.conkey[1]
+             WHERE nsp.nspname = current_schema()
+               AND rel.relname = $1
+               AND con.contype = 'u'
+               AND array_length(con.conkey, 1) = 1
+               AND att.attname = $2`,
+            [tbl, col]
+          );
+          for (const uRow of singleUniqueRows.rows) {
+            const safeConName = String(uRow.conname).replace(/"/g, '""');
+            await client.query(`ALTER TABLE ${tbl} DROP CONSTRAINT IF EXISTS "${safeConName}"`);
+          }
+        }
+
+        for (const idxStmt of POST_MIGRATION_INDEXES) {
+          await client.query(idxStmt);
         }
       } finally {
         if (locked) {
@@ -902,6 +1095,11 @@ async function createLibsqlAdapter(url, authToken) {
           await client.execute(alterStmt);
         } catch (_) {}
       }
+      for (const idxStmt of POST_MIGRATION_INDEXES) {
+        try {
+          await client.execute(idxStmt);
+        } catch (_) {}
+      }
     },
     async get(sql, params = []) {
       const res = await getExecutor().execute({ sql, args: params });
@@ -943,6 +1141,77 @@ async function createLibsqlAdapter(url, authToken) {
   };
 }
 
+function upgradeLegacySqliteIfNeeded(sqlite) {
+  const bsMeta = sqlite
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'business_settings'")
+    .get();
+  if (bsMeta?.sql && /CHECK\s*\(\s*id\s*=\s*1\s*\)/i.test(bsMeta.sql)) {
+    sqlite.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      sqlite.exec('ALTER TABLE business_settings RENAME TO _legacy_business_settings;');
+      const createBsStmt = SQLITE_SCHEMA_STATEMENTS.find((s) =>
+        s.includes('CREATE TABLE IF NOT EXISTS business_settings')
+      );
+      sqlite.exec(createBsStmt);
+      const oldCols = sqlite
+        .prepare('PRAGMA table_info(_legacy_business_settings)')
+        .all()
+        .map((c) => c.name);
+      const newCols = sqlite
+        .prepare('PRAGMA table_info(business_settings)')
+        .all()
+        .map((c) => c.name);
+      const sharedCols = oldCols.filter((c) => newCols.includes(c));
+      if (sharedCols.length > 0) {
+        const colList = sharedCols.join(', ');
+        sqlite.exec(
+          `INSERT INTO business_settings (${colList}) SELECT ${colList} FROM _legacy_business_settings;`
+        );
+      }
+      sqlite.exec('DROP TABLE _legacy_business_settings;');
+    } finally {
+      sqlite.exec('PRAGMA foreign_keys = ON;');
+    }
+  }
+
+  // Upgrade any legacy single-column UNIQUE table in local SQLite dev DB to composite UNIQUE(business_id, col)
+  for (const [tbl, col] of BUSINESS_UNIQUE_CODE_COLUMNS) {
+    const meta = sqlite
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(tbl);
+    if (
+      meta?.sql &&
+      new RegExp(`\\b${col}\\s+TEXT\\s+UNIQUE`, 'i').test(meta.sql) &&
+      !/UNIQUE\s*\(\s*business_id/i.test(meta.sql)
+    ) {
+      sqlite.exec('PRAGMA foreign_keys = OFF;');
+      try {
+        sqlite.exec(`ALTER TABLE ${tbl} RENAME TO _legacy_${tbl};`);
+        const createStmt = SQLITE_SCHEMA_STATEMENTS.find((s) =>
+          s.includes(`CREATE TABLE IF NOT EXISTS ${tbl} (`)
+        );
+        sqlite.exec(createStmt);
+        const oldCols = sqlite
+          .prepare(`PRAGMA table_info(_legacy_${tbl})`)
+          .all()
+          .map((c) => c.name);
+        const newCols = sqlite
+          .prepare(`PRAGMA table_info(${tbl})`)
+          .all()
+          .map((c) => c.name);
+        const sharedCols = oldCols.filter((c) => newCols.includes(c));
+        if (sharedCols.length > 0) {
+          const colList = sharedCols.join(', ');
+          sqlite.exec(`INSERT INTO ${tbl} (${colList}) SELECT ${colList} FROM _legacy_${tbl};`);
+        }
+        sqlite.exec(`DROP TABLE _legacy_${tbl};`);
+      } finally {
+        sqlite.exec('PRAGMA foreign_keys = ON;');
+      }
+    }
+  }
+}
+
 async function createNodeSqliteAdapter(sqliteFilePath) {
   const { DatabaseSync } = await import('node:sqlite');
   const dir = path.dirname(sqliteFilePath);
@@ -959,6 +1228,7 @@ async function createNodeSqliteAdapter(sqliteFilePath) {
     type: 'sqlite',
     rawDb: sqlite,
     async initSchema() {
+      upgradeLegacySqliteIfNeeded(sqlite);
       for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
         sqlite.exec(stmt);
       }
@@ -966,6 +1236,9 @@ async function createNodeSqliteAdapter(sqliteFilePath) {
         try {
           sqlite.exec(alterStmt);
         } catch (_) {}
+      }
+      for (const idxStmt of POST_MIGRATION_INDEXES) {
+        sqlite.exec(idxStmt);
       }
     },
     async get(sql, params = []) {
@@ -1007,6 +1280,113 @@ async function createNodeSqliteAdapter(sqliteFilePath) {
   };
 }
 
+async function seedAndVerifyMultiBusinessData(ad) {
+  const now = nowISO();
+
+  // 1. Seed the two canonical businesses in `businesses`
+  for (const biz of BUSINESS_DEFINITIONS) {
+    await ad.run(
+      `INSERT INTO businesses (id, slug, default_name, short_code, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO NOTHING`,
+      [biz.id, biz.slug, biz.default_name, biz.short_code, now]
+    );
+  }
+
+  // 2. Seed Business 1 (John Rois Stainless Steel Fabrication Shop) — preserves existing row 1 if present
+  await ad.run(
+    `INSERT INTO business_settings (
+      id, business_id, business_name, logo_url, address, contact_number, email,
+      facebook_url, maps_url, other_social_links, operating_hours,
+      default_payment_terms, updated_at
+    ) VALUES (
+      1,
+      1,
+      'John Rois Stainless Steel Fabrication Shop',
+      '',
+      'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
+      '+63 917 421 7417',
+      '',
+      'https://www.facebook.com/johnroiscanon',
+      'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
+      '',
+      'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
+      '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+      ?
+    )
+    ON CONFLICT (id) DO NOTHING`,
+    [now]
+  );
+
+  // Normalize untouched legacy default spelling on row 1 without modifying any other fields or logos
+  await ad.run(
+    `UPDATE business_settings
+     SET business_name = 'John Rois Stainless Steel Fabrication Shop',
+         business_id = 1
+     WHERE id = 1 AND business_name = 'Johnrois Stainless Steel Fabrication Shop'`
+  );
+  await ad.run('UPDATE business_settings SET business_id = 1 WHERE id = 1 AND business_id != 1');
+
+  // 3. Seed Business 2 (JREC Stainless Steel Fabrication) with independent clean settings & empty logo
+  await ad.run(
+    `INSERT INTO business_settings (
+      id, business_id, business_name, logo_url, address, contact_number, email,
+      facebook_url, maps_url, other_social_links, operating_hours,
+      default_payment_terms, updated_at
+    ) VALUES (
+      2,
+      2,
+      'JREC Stainless Steel Fabrication',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '',
+      '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
+      ?
+    )
+    ON CONFLICT (id) DO NOTHING`,
+    [now]
+  );
+  await ad.run('UPDATE business_settings SET business_id = 2 WHERE id = 2 AND business_id != 2');
+
+  // 4. Namespace any pre-existing John Rois document_sequences keys under BIZ1: so JREC sequences start cleanly at 1
+  await ad.run(
+    `UPDATE document_sequences
+     SET seq_key = 'BIZ1:' || seq_key,
+         business_id = 1
+     WHERE seq_key NOT LIKE 'BIZ%'`
+  );
+
+  // 5. Namespace legacy John Rois uploaded_files storage_path metadata without altering existing filenames
+  await ad.run(
+    `UPDATE uploaded_files
+     SET storage_path = 'john-rois/' || filename
+     WHERE business_id = 1 AND (storage_path IS NULL OR storage_path = '')`
+  );
+
+  // 6. Verify migration integrity: ensure both businesses & settings exist and no orphan business_id values exist
+  const bizRows = await ad.all('SELECT id, slug FROM businesses ORDER BY id ASC');
+  const settingsRows = await ad.all('SELECT id, business_id FROM business_settings ORDER BY id ASC');
+  if (bizRows.length < 2 || settingsRows.length < 2) {
+    throw new Error('Multi-business migration verification failed: expected 2 seeded businesses and settings.');
+  }
+
+  for (const tbl of BUSINESS_OWNED_TABLES) {
+    const invalidRow = await ad.get(
+      `SELECT COUNT(*) as cnt FROM ${tbl} WHERE business_id IS NULL OR business_id NOT IN (1, 2)`
+    );
+    if (Number(invalidRow?.cnt || 0) > 0) {
+      throw new Error(
+        `Multi-business migration verification failed: table ${tbl} has ${invalidRow.cnt} row(s) with invalid business_id.`
+      );
+    }
+  }
+}
+
 export async function ensureDbReady() {
   if (adapter) return adapter;
   if (initPromise) return initPromise;
@@ -1030,6 +1410,7 @@ export async function ensureDbReady() {
         persistent: true,
         is_serverless: isVercelRuntime,
         setup_required: false,
+        migration_verified: false,
         message: pgConfig.isNeon
           ? `Connected to persistent Neon PostgreSQL database (${pgConfig.envSource}).`
           : `Connected to persistent PostgreSQL database (${pgConfig.envSource}).`,
@@ -1043,6 +1424,7 @@ export async function ensureDbReady() {
         persistent: true,
         is_serverless: isVercelRuntime,
         setup_required: false,
+        migration_verified: false,
         message: 'Connected to persistent Turso / LibSQL cloud database.',
       };
     } else if (isVercelRuntime && !customSqlitePath) {
@@ -1055,6 +1437,7 @@ export async function ensureDbReady() {
         persistent: false,
         is_serverless: true,
         setup_required: true,
+        migration_verified: false,
         message:
           'Persistent database is not configured on Vercel yet. Connect Neon / Vercel Postgres (DATABASE_URL / POSTGRES_URL) or Turso (TURSO_DATABASE_URL + TURSO_AUTH_TOKEN) in Vercel Project Settings → Storage / Environment Variables and redeploy so saved records and uploads persist permanently.',
       };
@@ -1068,35 +1451,14 @@ export async function ensureDbReady() {
         persistent: dataDirInfo.writable || Boolean(customSqlitePath),
         is_serverless: false,
         setup_required: false,
+        migration_verified: false,
         message: `Connected to persistent SQLite database (${targetSqlitePath}).`,
       };
     }
 
     await candidateAdapter.initSchema();
-
-    // Concurrency-safe singleton business_settings seed using ONLY verified public details & editable blank fields
-    await candidateAdapter.run(
-      `INSERT INTO business_settings (
-        id, business_name, logo_url, address, contact_number, email,
-        facebook_url, maps_url, other_social_links, operating_hours,
-        default_payment_terms, updated_at
-      ) VALUES (
-        1,
-        'Johnrois Stainless Steel Fabrication Shop',
-        '',
-        'Brgy. Ubalde, R. Castillo, Davao City, Davao del Sur, Philippines',
-        '+63 917 421 7417',
-        '',
-        'https://www.facebook.com/johnroiscanon',
-        'https://goo.gl/maps/t4FehxJHF1j5PdfZ6',
-        '',
-        'Mon–Sat 8:00 AM – 5:00 PM | Sun 9:00 AM – 12:00 PM',
-        '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
-        ?
-      )
-      ON CONFLICT (id) DO NOTHING`,
-      [nowISO()]
-    );
+    await seedAndVerifyMultiBusinessData(candidateAdapter);
+    nextStatus.migration_verified = true;
 
     adapter = candidateAdapter;
     storageStatus = nextStatus;
@@ -1112,6 +1474,7 @@ export async function ensureDbReady() {
       persistent: false,
       is_serverless: Boolean(process.env.VERCEL),
       setup_required: false,
+      migration_verified: false,
       message: `Database connection error: ${err?.message || 'Unable to connect to database'}`,
     };
     throw err;
@@ -1144,7 +1507,7 @@ export async function syncSequencesAfterRestore() {
 }
 
 // ============================================================================
-// PERSISTENT FILE UPLOADS (STORED IN DATABASE + LOCAL CACHE WHEN WRITABLE)
+// PERSISTENT BUSINESS-ISOLATED FILE UPLOADS
 // ============================================================================
 
 const EXT_TO_MIME = {
@@ -1156,81 +1519,126 @@ const EXT_TO_MIME = {
   '.svg': 'image/svg+xml',
 };
 
-export async function saveUploadedFile({ filename, mimeType, buffer }) {
-  const safeName = path.basename(filename);
+export async function saveUploadedFile({ businessId = 1, filename, mimeType, buffer }) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) {
+    throw new Error('Valid business context is required to save uploaded files.');
+  }
+
+  const rawBase = path.basename(filename);
+  const safeName = rawBase.startsWith(`${biz.slug}-`) ? rawBase : `${biz.slug}-${rawBase}`;
+  const storagePath = `${biz.slug}/${safeName}`;
   const ext = path.extname(safeName).toLowerCase();
   const resolvedMime = mimeType || EXT_TO_MIME[ext] || 'application/octet-stream';
   const b64 = buffer.toString('base64');
 
   await dbRun(
-    `INSERT INTO uploaded_files (filename, mime_type, byte_size, data_base64, created_at)
-     VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO uploaded_files (filename, business_id, storage_path, mime_type, byte_size, data_base64, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (filename) DO UPDATE SET
+       business_id = EXCLUDED.business_id,
+       storage_path = EXCLUDED.storage_path,
        mime_type = EXCLUDED.mime_type,
        byte_size = EXCLUDED.byte_size,
        data_base64 = EXCLUDED.data_base64,
        created_at = EXCLUDED.created_at`,
-    [safeName, resolvedMime, buffer.length, b64, nowISO()]
+    [safeName, biz.id, storagePath, resolvedMime, buffer.length, b64, nowISO()]
   );
 
-  // Also cache to local uploads directory when writable for fast static access
   if (uploadsDirInfo.writable) {
     try {
-      fs.writeFileSync(path.join(UPLOADS_DIR, safeName), buffer);
+      const bizDir = path.join(UPLOADS_DIR, biz.slug);
+      if (!fs.existsSync(bizDir)) {
+        fs.mkdirSync(bizDir, { recursive: true });
+      }
+      fs.writeFileSync(path.join(bizDir, safeName), buffer);
     } catch (_) {}
   }
 
   return {
-    url: `/api/uploads/files/${safeName}`,
+    url: `/api/businesses/${biz.slug}/uploads/${safeName}`,
     filename: safeName,
+    storage_path: storagePath,
+    business_id: biz.id,
     mime_type: resolvedMime,
   };
 }
 
-export async function getUploadedFile(filename) {
+export async function getUploadedFile(filename, businessId = 1) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) return null;
+
   const safeName = path.basename(String(filename || ''));
   if (!safeName || safeName === '.gitkeep') return null;
 
   const row = await dbGet(
-    'SELECT filename, mime_type, data_base64 FROM uploaded_files WHERE filename = ?',
-    [safeName]
+    'SELECT filename, business_id, mime_type, data_base64 FROM uploaded_files WHERE filename = ? AND business_id = ?',
+    [safeName, biz.id]
   );
   if (row && row.data_base64) {
     return {
       filename: row.filename,
+      business_id: Number(row.business_id),
       mime_type: row.mime_type,
       buffer: Buffer.from(row.data_base64, 'base64'),
     };
   }
 
-  // Fallback to legacy local disk file if present, and migrate into DB
-  const diskPath = path.join(UPLOADS_DIR, safeName);
-  if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
-    const buffer = fs.readFileSync(diskPath);
-    const ext = path.extname(safeName).toLowerCase();
-    const mime_type = EXT_TO_MIME[ext] || 'image/png';
-    try {
-      await saveUploadedFile({ filename: safeName, mimeType: mime_type, buffer });
-    } catch (_) {}
-    return { filename: safeName, mime_type, buffer };
+  // Fallback to business-scoped disk cache (or legacy root uploads dir for Business 1 only)
+  const candidateDiskPaths = [path.join(UPLOADS_DIR, biz.slug, safeName)];
+  if (biz.id === 1) {
+    candidateDiskPaths.push(path.join(UPLOADS_DIR, safeName));
+  }
+
+  for (const diskPath of candidateDiskPaths) {
+    if (fs.existsSync(diskPath) && fs.statSync(diskPath).isFile()) {
+      const buffer = fs.readFileSync(diskPath);
+      const ext = path.extname(safeName).toLowerCase();
+      const mime_type = EXT_TO_MIME[ext] || 'image/png';
+      try {
+        await dbRun(
+          `INSERT INTO uploaded_files (filename, business_id, storage_path, mime_type, byte_size, data_base64, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT (filename) DO NOTHING`,
+          [safeName, biz.id, `${biz.slug}/${safeName}`, mime_type, buffer.length, buffer.toString('base64'), nowISO()]
+        );
+      } catch (_) {}
+      return { filename: safeName, business_id: biz.id, mime_type, buffer };
+    }
   }
 
   return null;
 }
 
-export async function resolveUploadBufferFromUrl(urlPath) {
-  if (!urlPath || typeof urlPath !== 'string') return null;
+export async function resolveUploadBufferFromUrl(urlPath, businessId = 1) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz || !urlPath || typeof urlPath !== 'string') return null;
+
   let cleanPath = urlPath.trim();
   try {
     if (/^https?:\/\//i.test(cleanPath)) {
       cleanPath = new URL(cleanPath).pathname;
     }
   } catch (_) {}
-  if (!cleanPath.includes('/uploads/')) return null;
-  const fname = path.basename(cleanPath);
-  const fileObj = await getUploadedFile(fname);
+
+  const bizScopedMatch = cleanPath.match(/^\/api\/businesses\/([^/]+)\/uploads\/([^/?#]+)$/i);
+  let fname = '';
+  if (bizScopedMatch) {
+    const urlBiz = resolveBusinessIdentity(bizScopedMatch[1]);
+    if (!urlBiz || urlBiz.id !== biz.id) {
+      return null;
+    }
+    fname = path.basename(bizScopedMatch[2]);
+  } else if (cleanPath.includes('/uploads/')) {
+    // Legacy pre-multi-business upload paths belong exclusively to Business 1 (John Rois)
+    if (biz.id !== 1) return null;
+    fname = path.basename(cleanPath);
+  } else {
+    return null;
+  }
+
+  const fileObj = await getUploadedFile(fname, biz.id);
   if (!fileObj) return null;
-  // PDFKit supports PNG and JPEG buffers natively
   if (!['image/png', 'image/jpeg', 'image/jpg'].includes(fileObj.mime_type.toLowerCase())) {
     const ext = path.extname(fname).toLowerCase();
     if (!['.png', '.jpg', '.jpeg'].includes(ext)) return null;
@@ -1239,11 +1647,33 @@ export async function resolveUploadBufferFromUrl(urlPath) {
 }
 
 // ============================================================================
-// BUSINESS SETTINGS, SEQUENCES & ACCOUNTING DOMAIN LOGIC
+// BUSINESS SETTINGS, SEQUENCES & ACCOUNTING DOMAIN LOGIC (TENANT-SCOPED)
 // ============================================================================
 
-export async function getSettings() {
-  return dbGet('SELECT * FROM business_settings WHERE id = 1');
+export async function getBusinessesSummary() {
+  const rows = await dbAll(
+    `SELECT b.id, b.slug, b.default_name, b.short_code,
+            s.business_name, s.logo_url, s.address, s.contact_number
+     FROM businesses b
+     LEFT JOIN business_settings s ON s.id = b.id
+     ORDER BY b.id ASC`
+  );
+  return rows.map((r) => ({
+    id: Number(r.id),
+    slug: r.slug,
+    default_name: r.default_name,
+    short_code: r.short_code,
+    business_name: r.business_name || r.default_name,
+    logo_url: r.logo_url || '',
+    address: r.address || '',
+    contact_number: r.contact_number || '',
+  }));
+}
+
+export async function getSettings(businessId = 1) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) throw new Error('Invalid business ID.');
+  return dbGet('SELECT * FROM business_settings WHERE id = ?', [biz.id]);
 }
 
 export function formatDocNumber(settings, type, nextVal, yearStr) {
@@ -1270,25 +1700,34 @@ export function formatDocNumber(settings, type, nextVal, yearStr) {
   return includeYear ? `${prefix}-${yearStr}-${numPart}` : `${prefix}-${numPart}`;
 }
 
-export async function previewNextDocNumber(type, dateStr = todayYMD()) {
-  const settings = await getSettings();
-  const yearStr = dateStr && dateStr.length >= 4 ? dateStr.slice(0, 4) : todayYMD().slice(0, 4);
-  const seqKey =
+function buildScopedSeqKey(businessId, type, yearStr) {
+  const baseKey =
     type === 'customer' || type === 'product' || type === 'employee'
       ? type.toUpperCase()
       : `${type.toUpperCase()}-${yearStr}`;
-  const row = await dbGet('SELECT last_val FROM document_sequences WHERE seq_key = ?', [seqKey]);
+  return `BIZ${businessId}:${baseKey}`;
+}
+
+export async function previewNextDocNumber(businessId, type, dateStr = todayYMD()) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) throw new Error('Invalid business context.');
+  const settings = await getSettings(biz.id);
+  const yearStr = dateStr && dateStr.length >= 4 ? dateStr.slice(0, 4) : todayYMD().slice(0, 4);
+  const seqKey = buildScopedSeqKey(biz.id, type, yearStr);
+  const row = await dbGet(
+    'SELECT last_val FROM document_sequences WHERE seq_key = ? AND business_id = ?',
+    [seqKey, biz.id]
+  );
   const nextVal = (row ? Number(row.last_val) : 0) + 1;
   return formatDocNumber(settings, type, nextVal, yearStr);
 }
 
-export async function allocateNextDocNumber(type, dateStr = todayYMD()) {
-  const settings = await getSettings();
+export async function allocateNextDocNumber(businessId, type, dateStr = todayYMD()) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) throw new Error('Invalid business context.');
+  const settings = await getSettings(biz.id);
   const yearStr = dateStr && dateStr.length >= 4 ? dateStr.slice(0, 4) : todayYMD().slice(0, 4);
-  const seqKey =
-    type === 'customer' || type === 'product' || type === 'employee'
-      ? type.toUpperCase()
-      : `${type.toUpperCase()}-${yearStr}`;
+  const seqKey = buildScopedSeqKey(biz.id, type, yearStr);
 
   const tableColumnMap = {
     quotation: ['quotations', 'quotation_number'],
@@ -1309,21 +1748,25 @@ export async function allocateNextDocNumber(type, dateStr = todayYMD()) {
   while (attempts < 1000) {
     attempts++;
     const seqRow = await dbGet(
-      `INSERT INTO document_sequences (seq_key, last_val)
-       VALUES (?, 1)
+      `INSERT INTO document_sequences (seq_key, business_id, last_val)
+       VALUES (?, ?, 1)
        ON CONFLICT (seq_key) DO UPDATE SET last_val = document_sequences.last_val + 1
        RETURNING last_val`,
-      [seqKey]
+      [seqKey, biz.id]
     );
     const nextVal = Number(seqRow?.last_val || 1);
     const candidate = formatDocNumber(settings, type, nextVal, yearStr);
-    const collision = await dbGet(`SELECT id FROM ${table} WHERE ${col} = ?`, [candidate]);
+    const collision = await dbGet(
+      `SELECT id FROM ${table} WHERE business_id = ? AND ${col} = ?`,
+      [biz.id, candidate]
+    );
     if (!collision) return candidate;
   }
   throw new Error(`Unable to allocate unique document number for ${type}`);
 }
 
 export async function logActivity({
+  business_id,
   entity_type,
   entity_id = null,
   document_number = '',
@@ -1334,12 +1777,15 @@ export async function logActivity({
   amount = null,
   actor_name = '',
 }) {
+  const biz = resolveBusinessIdentity(business_id);
+  if (!biz) throw new Error('Valid business_id is required for activity logging.');
   await dbRun(
     `INSERT INTO activity_logs (
-      entity_type, entity_id, document_number, customer_id, customer_name,
+      business_id, entity_type, entity_id, document_number, customer_id, customer_name,
       action, summary, amount, actor_name, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      biz.id,
       entity_type,
       entity_id,
       document_number || '',
@@ -1354,24 +1800,30 @@ export async function logActivity({
   );
 }
 
-export async function recalculateInvoicePaymentState(invoiceId) {
-  const inv = await dbGet('SELECT * FROM invoices WHERE id = ?', [invoiceId]);
+export async function recalculateInvoicePaymentState(businessId, invoiceId) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) return null;
+
+  const inv = await dbGet('SELECT * FROM invoices WHERE id = ? AND business_id = ?', [
+    invoiceId,
+    biz.id,
+  ]);
   if (!inv) return null;
 
   const payAgg = await dbGet(
     `SELECT COALESCE(SUM(amount), 0) as total_paid
      FROM payments
-     WHERE invoice_id = ?`,
-    [invoiceId]
+     WHERE invoice_id = ? AND business_id = ?`,
+    [invoiceId, biz.id]
   );
 
   const latestPayment = await dbGet(
     `SELECT payment_method, payment_date
      FROM payments
-     WHERE invoice_id = ?
+     WHERE invoice_id = ? AND business_id = ?
      ORDER BY payment_date DESC, id DESC
      LIMIT 1`,
-    [invoiceId]
+    [invoiceId, biz.id]
   );
 
   const amountPaid = round2(payAgg?.total_paid || 0);
@@ -1400,7 +1852,7 @@ export async function recalculateInvoicePaymentState(invoiceId) {
          payment_date = ?,
          status = ?,
          updated_at = ?
-     WHERE id = ?`,
+     WHERE id = ? AND business_id = ?`,
     [
       amountPaid,
       remaining,
@@ -1409,55 +1861,91 @@ export async function recalculateInvoicePaymentState(invoiceId) {
       status,
       nowISO(),
       invoiceId,
+      biz.id,
     ]
   );
 
-  return dbGet('SELECT * FROM invoices WHERE id = ?', [invoiceId]);
+  return dbGet('SELECT * FROM invoices WHERE id = ? AND business_id = ?', [invoiceId, biz.id]);
 }
 
-export async function refreshTimeSensitiveStatuses() {
+export async function refreshTimeSensitiveStatuses(businessId) {
   if (!storageStatus.persistent) return;
+  const biz = resolveBusinessIdentity(businessId);
   const today = todayYMD();
-  await dbRun(
-    `UPDATE invoices
-     SET status = 'Overdue'
-     WHERE is_archived = 0
-       AND remaining_balance > 0.009
-       AND due_date != ''
-       AND due_date < ?
-       AND status != 'Overdue'`,
-    [today]
-  );
 
-  await dbRun(
-    `UPDATE quotations
-     SET status = 'Expired'
-     WHERE is_archived = 0
-       AND status = 'Sent'
-       AND valid_until != ''
-       AND valid_until < ?`,
-    [today]
-  );
+  if (biz) {
+    await dbRun(
+      `UPDATE invoices
+       SET status = 'Overdue'
+       WHERE business_id = ?
+         AND is_archived = 0
+         AND remaining_balance > 0.009
+         AND due_date != ''
+         AND due_date < ?
+         AND status != 'Overdue'`,
+      [biz.id, today]
+    );
+    await dbRun(
+      `UPDATE quotations
+       SET status = 'Expired'
+       WHERE business_id = ?
+         AND is_archived = 0
+         AND status = 'Sent'
+         AND valid_until != ''
+         AND valid_until < ?`,
+      [biz.id, today]
+    );
+  } else {
+    await dbRun(
+      `UPDATE invoices
+       SET status = 'Overdue'
+       WHERE is_archived = 0
+         AND remaining_balance > 0.009
+         AND due_date != ''
+         AND due_date < ?
+         AND status != 'Overdue'`,
+      [today]
+    );
+    await dbRun(
+      `UPDATE quotations
+       SET status = 'Expired'
+       WHERE is_archived = 0
+         AND status = 'Sent'
+         AND valid_until != ''
+         AND valid_until < ?`,
+      [today]
+    );
+  }
 }
 
-export async function computeCustomerStatementLedger(customerId, periodFrom, periodTo) {
+export async function computeCustomerStatementLedger(
+  businessId,
+  customerId,
+  periodFrom,
+  periodTo
+) {
+  const biz = resolveBusinessIdentity(businessId);
+  if (!biz) throw new Error('Invalid business context.');
+
   const prevInvRow = await dbGet(
     `SELECT COALESCE(SUM(total_amount_due), 0) as total
      FROM invoices
-     WHERE customer_id = ?
+     WHERE business_id = ?
+       AND customer_id = ?
        AND is_archived = 0
        AND invoice_date < ?`,
-    [customerId, periodFrom]
+    [biz.id, customerId, periodFrom]
   );
 
   const prevPayRow = await dbGet(
     `SELECT COALESCE(SUM(p.amount), 0) as total
      FROM payments p
-     JOIN invoices i ON i.id = p.invoice_id
-     WHERE i.customer_id = ?
+     JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
+     WHERE p.business_id = ?
+       AND i.customer_id = ?
        AND i.is_archived = 0
        AND p.payment_date < ?`,
-    [customerId, periodFrom]
+    [biz.id, customerId, periodFrom]
   );
 
   const previousBalance = round2((prevInvRow?.total || 0) - (prevPayRow?.total || 0));
@@ -1465,25 +1953,27 @@ export async function computeCustomerStatementLedger(customerId, periodFrom, per
   const periodInvoices = await dbAll(
     `SELECT id, invoice_number, invoice_date, project_name, reference_quotation_number, total_amount_due
      FROM invoices
-     WHERE customer_id = ?
+     WHERE business_id = ?
+       AND customer_id = ?
        AND is_archived = 0
        AND invoice_date >= ?
        AND invoice_date <= ?
      ORDER BY invoice_date ASC, id ASC`,
-    [customerId, periodFrom, periodTo]
+    [biz.id, customerId, periodFrom, periodTo]
   );
 
   const periodPayments = await dbAll(
     `SELECT p.id, p.payment_number, p.payment_date, p.amount, p.payment_method, p.reference_number, p.notes,
             i.invoice_number, i.invoice_date
      FROM payments p
-     JOIN invoices i ON i.id = p.invoice_id
-     WHERE i.customer_id = ?
+     JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
+     WHERE p.business_id = ?
+       AND i.customer_id = ?
        AND i.is_archived = 0
        AND p.payment_date >= ?
        AND p.payment_date <= ?
      ORDER BY p.payment_date ASC, p.id ASC`,
-    [customerId, periodFrom, periodTo]
+    [biz.id, customerId, periodFrom, periodTo]
   );
 
   const rawEntries = [];
@@ -1491,7 +1981,8 @@ export async function computeCustomerStatementLedger(customerId, periodFrom, per
   for (const inv of periodInvoices) {
     const descParts = [`Invoice ${inv.invoice_number}`];
     if (inv.project_name) descParts.push(`— ${inv.project_name}`);
-    else if (inv.reference_quotation_number) descParts.push(`(Ref: ${inv.reference_quotation_number})`);
+    else if (inv.reference_quotation_number)
+      descParts.push(`(Ref: ${inv.reference_quotation_number})`);
     rawEntries.push({
       tx_date: inv.invoice_date,
       sort_priority: 1,
@@ -1507,7 +1998,9 @@ export async function computeCustomerStatementLedger(customerId, periodFrom, per
   }
 
   for (const pay of periodPayments) {
-    const details = [`Payment ${pay.payment_number} (${pay.payment_method}) for ${pay.invoice_number}`];
+    const details = [
+      `Payment ${pay.payment_number} (${pay.payment_method}) for ${pay.invoice_number}`,
+    ];
     if (pay.reference_number) details.push(`[Ref: ${pay.reference_number}]`);
     rawEntries.push({
       tx_date: pay.payment_date,

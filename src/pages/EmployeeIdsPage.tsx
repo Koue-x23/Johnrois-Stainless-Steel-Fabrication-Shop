@@ -18,9 +18,11 @@ import {
 import { BusinessSettings, Employee, EmployeeIdCard, IdCardStatus } from '../types';
 import {
   apiFetch,
+  buildWorkspacePath,
   downloadAuthenticatedFile,
   formatDate,
   generateIdempotencyKey,
+  getActiveBusinessSlug,
   resolveAssetUrl,
   todayYMD,
   uploadImageFile,
@@ -115,7 +117,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
 
   const syncBrowserUrl = (id?: number | null) => {
     if (typeof window === 'undefined') return;
-    const nextPath = id ? `/employee-ids/${id}` : '/employee-ids';
+    const nextPath = buildWorkspacePath(id ? `/employee-ids/${id}` : '/employee-ids');
     if (window.location.pathname !== nextPath) {
       window.history.replaceState({}, '', nextPath);
     }
@@ -854,7 +856,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
             onClick={() =>
               downloadAuthenticatedFile(
                 '/api/backup/export-csv/employee-id-cards',
-                `johnrois-employee-ids-${todayYMD()}.csv`
+                `${getActiveBusinessSlug() || 'workspace'}-employee-ids-${todayYMD()}.csv`
               ).catch((err) => setError(err.message))
             }
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"

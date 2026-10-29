@@ -42,17 +42,23 @@ export function formatDateDisplay(ymd) {
   });
 }
 
-function createA4Document(title) {
+function resolveBusinessIdFromSettings(settings) {
+  return Number(settings?.business_id || settings?.id || 1);
+}
+
+function createA4Document(title, settings) {
+  const bizName = settings?.business_name || 'Stainless Steel Fabrication';
   const doc = new PDFDocument({
     size: 'A4',
     margins: { top: 38, bottom: 48, left: 40, right: 40 },
     bufferPages: true,
     info: {
       Title: title,
-      Author: 'Johnrois Stainless Steel Fabrication Shop',
-      Creator: 'Johnrois Business Management System',
+      Author: bizName,
+      Creator: `${bizName} — Business Management System`,
     },
   });
+  doc._businessId = resolveBusinessIdFromSettings(settings);
 
   if (fs.existsSync(FONT_REGULAR)) doc.registerFont('Sans', FONT_REGULAR);
   if (fs.existsSync(FONT_BOLD)) doc.registerFont('SansBold', FONT_BOLD);
@@ -74,7 +80,8 @@ async function drawBusinessHeader(doc, settings, docTitle, docNumber, statusLabe
   const contentWidth = right - left;
   const y = doc.page.margins.top;
 
-  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url);
+  const bizId = doc._businessId || resolveBusinessIdFromSettings(settings);
+  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url, bizId);
   let textStartX = left;
 
   if (logoBuf) {
@@ -91,7 +98,7 @@ async function drawBusinessHeader(doc, settings, docTitle, docNumber, statusLabe
   fontBold(doc)
     .fontSize(13.5)
     .fillColor('#0f172a')
-    .text(settings.business_name || 'Johnrois Stainless Steel Fabrication Shop', textStartX, y, {
+    .text(settings.business_name || 'Stainless Steel Fabrication', textStartX, y, {
       width: maxBizWidth,
     });
 
@@ -338,7 +345,7 @@ async function drawSignatureArea(doc, blocks) {
     const x = left + idx * (colW + gap);
     fontRegular(doc).fontSize(8).fillColor('#475569').text(blk.heading, x, startY, { width: colW });
 
-    const sigBuf = await resolveUploadBufferFromUrl(blk.signatureUrl);
+    const sigBuf = await resolveUploadBufferFromUrl(blk.signatureUrl, doc._businessId || 1);
     if (sigBuf) {
       try {
         doc.image(sigBuf, x + 8, startY + 14, { fit: [120, 36] });
@@ -382,7 +389,7 @@ function stampPageFooters(doc, settings, docLabel) {
 
     fontRegular(doc).fontSize(7.5).fillColor('#64748b');
     doc.text(
-      `${settings.business_name || 'Johnrois Stainless Steel Fabrication Shop'}  •  ${docLabel}`,
+      `${settings.business_name || 'Stainless Steel Fabrication'}  •  ${docLabel}`,
       left,
       footerY,
       { width: (right - left) * 0.7, align: 'left', lineBreak: false }
@@ -408,7 +415,7 @@ function finalizePdfBuffer(doc) {
 }
 
 export async function generateQuotationPdf(quotation, items, settings) {
-  const doc = createA4Document(`Quotation ${quotation.quotation_number}`);
+  const doc = createA4Document(`Quotation ${quotation.quotation_number}`, settings);
   await drawBusinessHeader(doc, settings, 'Quotation', quotation.quotation_number, quotation.status);
 
   drawTwoColumnMetaBox(
@@ -500,7 +507,7 @@ export async function generateQuotationPdf(quotation, items, settings) {
 }
 
 export async function generateInvoicePdf(invoice, items, payments, settings) {
-  const doc = createA4Document(`Invoice ${invoice.invoice_number}`);
+  const doc = createA4Document(`Invoice ${invoice.invoice_number}`, settings);
   await drawBusinessHeader(doc, settings, 'Billing Invoice', invoice.invoice_number, invoice.status);
 
   drawTwoColumnMetaBox(
@@ -618,7 +625,7 @@ export async function generateInvoicePdf(invoice, items, payments, settings) {
 }
 
 export async function generateServiceReportPdf(report, materials, photos, settings) {
-  const doc = createA4Document(`Service Report ${report.report_number}`);
+  const doc = createA4Document(`Service Report ${report.report_number}`, settings);
   await drawBusinessHeader(doc, settings, 'Service Report', report.report_number, report.status);
 
   drawTwoColumnMetaBox(
@@ -689,7 +696,7 @@ export async function generateServiceReportPdf(report, materials, photos, settin
   // Optional Before & After Photos loaded from persistent DB storage
   const resolvedPhotos = [];
   for (const p of photos || []) {
-    const buf = await resolveUploadBufferFromUrl(p.photo_url);
+    const buf = await resolveUploadBufferFromUrl(p.photo_url, doc._businessId || 1);
     if (buf) resolvedPhotos.push({ ...p, buf });
   }
 
@@ -758,7 +765,7 @@ export async function generateServiceReportPdf(report, materials, photos, settin
 }
 
 export async function generateBillingStatementPdf(statement, lines, settings) {
-  const doc = createA4Document(`Billing Statement ${statement.statement_number}`);
+  const doc = createA4Document(`Billing Statement ${statement.statement_number}`, settings);
   await drawBusinessHeader(doc, settings, 'Billing Statement', statement.statement_number, 'Statement of Account');
 
   drawTwoColumnMetaBox(
@@ -895,7 +902,7 @@ function formatSalaryPeriodLabel(period) {
 }
 
 export async function generatePayslipPdf(payslip, settings) {
-  const doc = createA4Document(`Payslip ${payslip.payslip_number}`);
+  const doc = createA4Document(`Payslip ${payslip.payslip_number}`, settings);
   await drawBusinessHeader(
     doc,
     settings,
@@ -1114,14 +1121,15 @@ export async function generatePayslipPdf(payslip, settings) {
 }
 
 export async function generateCoePdf(coe, settings) {
-  const doc = createA4Document(`Certificate of Employment ${coe.certificate_number}`);
+  const doc = createA4Document(`Certificate of Employment ${coe.certificate_number}`, settings);
+  const bizId = doc._businessId || 1;
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
   const contentW = right - left;
   let y = doc.page.margins.top + 4;
 
   // Formal Letterhead
-  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url);
+  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url, bizId);
   let textX = left;
   if (logoBuf) {
     try {
@@ -1135,7 +1143,7 @@ export async function generateCoePdf(coe, settings) {
   fontBold(doc)
     .fontSize(14)
     .fillColor('#0f172a')
-    .text(settings.business_name || 'Johnrois Stainless Steel Fabrication Shop', textX, y, {
+    .text(settings.business_name || 'Stainless Steel Fabrication', textX, y, {
       width: contentW - (textX - left),
     });
 
@@ -1192,7 +1200,7 @@ export async function generateCoePdf(coe, settings) {
 
   const startFormatted = formatLongDate(coe.start_date);
   const endFormatted = coe.end_date ? formatLongDate(coe.end_date) : 'present';
-  const bizName = settings.business_name || 'Johnrois Stainless Steel Fabrication Shop';
+  const bizName = settings.business_name || 'Stainless Steel Fabrication';
 
   if (coe.custom_body && String(coe.custom_body).trim()) {
     doc.text(String(coe.custom_body).trim(), left, cursorY, {
@@ -1239,7 +1247,7 @@ export async function generateCoePdf(coe, settings) {
   const sigBlockW = 230;
   fontRegular(doc).fontSize(9.5).fillColor('#334155').text('Certified by:', left, sigTop);
 
-  const sigImgBuf = await resolveUploadBufferFromUrl(coe.signature_url);
+  const sigImgBuf = await resolveUploadBufferFromUrl(coe.signature_url, bizId);
   if (sigImgBuf) {
     try {
       doc.image(sigImgBuf, left + 6, sigTop + 16, { fit: [135, 42] });
@@ -1276,7 +1284,8 @@ export async function generateCoePdf(coe, settings) {
 }
 
 export async function generateEmployeeIdPdf(card, settings) {
-  const doc = createA4Document(`Employee ID ${card.employee_code}`);
+  const doc = createA4Document(`Employee ID ${card.employee_code}`, settings);
+  const bizId = doc._businessId || 1;
   const left = doc.page.margins.left;
   const right = doc.page.width - doc.page.margins.right;
   const contentW = right - left;
@@ -1285,7 +1294,7 @@ export async function generateEmployeeIdPdf(card, settings) {
     .fontSize(12)
     .fillColor('#0f172a')
     .text(
-      `${settings.business_name || 'Johnrois Stainless Steel Fabrication Shop'} — Employee ID Print Sheet`,
+      `${settings.business_name || 'Stainless Steel Fabrication'} — Employee ID Print Sheet`,
       left,
       42,
       { width: contentW }
@@ -1324,7 +1333,7 @@ export async function generateEmployeeIdPdf(card, settings) {
   doc.rect(frontX, startY, cardW, 48).fill('#0f172a');
   doc.rect(frontX, startY + 48, cardW, 3).fill('#0284c7');
 
-  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url);
+  const logoBuf = await resolveUploadBufferFromUrl(settings.logo_url, bizId);
   let headerTextX = frontX + 8;
   let headerTextW = cardW - 16;
   if (logoBuf) {
@@ -1342,7 +1351,7 @@ export async function generateEmployeeIdPdf(card, settings) {
     .fontSize(7.2)
     .fillColor('#ffffff')
     .text(
-      (settings.business_name || 'Johnrois Stainless Steel Fabrication Shop').toUpperCase(),
+      (settings.business_name || 'Stainless Steel Fabrication').toUpperCase(),
       headerTextX,
       startY + 11,
       { width: headerTextW, lineGap: 1 }
@@ -1358,7 +1367,7 @@ export async function generateEmployeeIdPdf(card, settings) {
   doc.rect(photoX, photoY, photoBoxW, photoBoxH).fill('#f1f5f9');
   doc.restore();
 
-  const empPhotoBuf = await resolveUploadBufferFromUrl(card.photo_url);
+  const empPhotoBuf = await resolveUploadBufferFromUrl(card.photo_url, bizId);
   if (empPhotoBuf) {
     try {
       doc.image(empPhotoBuf, photoX + 2, photoY + 2, {
@@ -1496,7 +1505,7 @@ export async function generateEmployeeIdPdf(card, settings) {
 
   // Authorized Signatory Area on Back
   const backSigLineY = startY + cardH - 58;
-  const sigBuf = await resolveUploadBufferFromUrl(card.signature_url);
+  const sigBuf = await resolveUploadBufferFromUrl(card.signature_url, bizId);
   if (sigBuf) {
     try {
       doc.image(sigBuf, backX + (cardW - 72) / 2, backSigLineY - 24, { fit: [72, 22] });
@@ -1527,7 +1536,7 @@ export async function generateEmployeeIdPdf(card, settings) {
   const returnText =
     card.back_notes?.trim() ||
     [
-      `Property of ${settings.business_name || 'Johnrois Stainless Steel Fabrication Shop'}.`,
+      `Property of ${settings.business_name || 'Stainless Steel Fabrication'}.`,
       settings.address,
       settings.contact_number ? `Tel: ${settings.contact_number}` : '',
     ]

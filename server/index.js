@@ -23,6 +23,8 @@ import {
   round2,
   nowISO,
   todayYMD,
+  resolveBusinessIdentity,
+  getBusinessesSummary,
   getSettings,
   previewNextDocNumber,
   allocateNextDocNumber,
@@ -119,7 +121,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader(
       'Access-Control-Allow-Headers',
-      'Content-Type, X-Idempotency-Key, Authorization'
+      'Content-Type, X-Idempotency-Key, X-Business-Id, Authorization'
     );
     if (req.method === 'OPTIONS') {
       return res.status(204).end();
@@ -138,10 +140,27 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// Serve uploaded images/logos/signatures from persistent DB storage (with local disk fallback)
-const serveUploadedAsset = asyncHandler(async (req, res) => {
+// Serve uploaded images/logos/signatures with strict per-business isolation
+const serveBusinessUploadedAsset = asyncHandler(async (req, res) => {
   await ensureDbReady();
-  const fileObj = await getUploadedFile(req.params.filename);
+  const biz = resolveBusinessIdentity(req.params.businessSlug);
+  if (!biz) {
+    return res.status(404).json({ error: 'Business workspace not found.' });
+  }
+  const fileObj = await getUploadedFile(req.params.filename, biz.id);
+  if (!fileObj) {
+    return res.status(404).json({ error: 'Uploaded file not found in this business workspace.' });
+  }
+  res.setHeader('Content-Type', fileObj.mime_type || 'application/octet-stream');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(fileObj.buffer);
+});
+
+// Legacy upload paths strictly restricted to Business 1 (John Rois Stainless Steel Fabrication Shop)
+const serveLegacyJohnRoisAsset = asyncHandler(async (req, res) => {
+  await ensureDbReady();
+  const fileObj = await getUploadedFile(req.params.filename, 1);
   if (!fileObj) {
     return res.status(404).json({ error: 'Uploaded file not found.' });
   }
@@ -151,8 +170,9 @@ const serveUploadedAsset = asyncHandler(async (req, res) => {
   res.send(fileObj.buffer);
 });
 
-app.get('/api/uploads/files/:filename', serveUploadedAsset);
-app.get('/uploads/:filename', serveUploadedAsset);
+app.get('/api/businesses/:businessSlug/uploads/:filename', serveBusinessUploadedAsset);
+app.get('/api/uploads/files/:filename', serveLegacyJohnRoisAsset);
+app.get('/uploads/:filename', serveLegacyJohnRoisAsset);
 
 // Health & storage readiness endpoint
 app.get(
@@ -167,7 +187,19 @@ app.get(
   })
 );
 
-// Attach direct internal workspace operator context & guard against unconfigured serverless writes
+// Public business directory endpoint for the Main Welcome Screen
+app.get(
+  '/api/businesses',
+  asyncHandler(async (_req, res) => {
+    await ensureDbReady();
+    res.json({
+      businesses: await getBusinessesSummary(),
+      storage: getStorageStatus(),
+    });
+  })
+);
+
+// Strict server-side business context middleware for all workspace API endpoints
 app.use(
   '/api',
   asyncHandler(async (req, res, next) => {
@@ -182,7 +214,43 @@ app.use(
         setup_required: true,
       });
     }
-    const settings = await getSettings();
+
+    const rawHeader = req.headers['x-business-id'];
+    const rawQuery = req.query?.business;
+    const headerBiz =
+      rawHeader !== undefined && String(rawHeader).trim() !== ''
+        ? resolveBusinessIdentity(rawHeader)
+        : null;
+    const queryBiz =
+      rawQuery !== undefined && String(rawQuery).trim() !== ''
+        ? resolveBusinessIdentity(rawQuery)
+        : null;
+
+    if (rawHeader !== undefined && String(rawHeader).trim() !== '' && !headerBiz) {
+      return res.status(400).json({ error: 'Invalid business workspace header (X-Business-Id).' });
+    }
+    if (rawQuery !== undefined && String(rawQuery).trim() !== '' && !queryBiz) {
+      return res.status(400).json({ error: 'Invalid business workspace query parameter.' });
+    }
+    if (headerBiz && queryBiz && headerBiz.id !== queryBiz.id) {
+      return res.status(400).json({
+        error: 'Conflicting business workspace identifiers between request header and query.',
+      });
+    }
+
+    const activeBiz = headerBiz || queryBiz;
+    if (!activeBiz) {
+      return res.status(400).json({
+        error: 'Active business workspace context (X-Business-Id) is required.',
+      });
+    }
+
+    req.business = activeBiz;
+    req.businessId = activeBiz.id;
+    req.businessSlug = activeBiz.slug;
+
+    const settings = await getSettings(activeBiz.id);
+    req.settings = settings;
     req.user = {
       id: null,
       full_name: settings?.authorized_representative || '',
@@ -192,12 +260,73 @@ app.use(
   })
 );
 
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function assertAssetUrlBelongsToBusiness(rawUrl, businessId, label = 'Image URL') {
+  const val = String(rawUrl ?? '').trim();
+  if (!val) return '';
+
+  let pathname = val;
+  try {
+    if (/^https?:\/\//i.test(val)) {
+      pathname = new URL(val).pathname;
+    }
+  } catch (_) {}
+
+  const bizScopedMatch = pathname.match(/^\/api\/businesses\/([^/]+)\/uploads\/([^/?#]+)$/i);
+  if (bizScopedMatch) {
+    const urlBiz = resolveBusinessIdentity(bizScopedMatch[1]);
+    if (!urlBiz || urlBiz.id !== businessId) {
+      throw new HttpError(403, `${label} belongs to a different business workspace.`);
+    }
+    const fileObj = await getUploadedFile(bizScopedMatch[2], businessId);
+    if (!fileObj) {
+      throw new HttpError(400, `${label} does not exist in this business workspace.`);
+    }
+    return `/api/businesses/${urlBiz.slug}/uploads/${fileObj.filename}`;
+  }
+
+  if (pathname.startsWith('/api/uploads/files/') || pathname.startsWith('/uploads/')) {
+    if (businessId !== 1) {
+      throw new HttpError(403, `${label} belongs to a different business workspace.`);
+    }
+    const fname = path.basename(pathname);
+    const fileObj = await getUploadedFile(fname, 1);
+    if (!fileObj) {
+      throw new HttpError(400, `${label} does not exist in this business workspace.`);
+    }
+    return val;
+  }
+
+  throw new HttpError(400, `Unsupported ${label} path.`);
+}
+
+async function assertProductsBelongToBusiness(items, businessId) {
+  for (const it of items || []) {
+    if (it.product_id) {
+      const prod = await dbGet(
+        'SELECT id FROM products_services WHERE id = ? AND business_id = ?',
+        [Number(it.product_id), businessId]
+      );
+      if (!prod) {
+        throw new HttpError(404, 'Referenced product or service does not exist in this business workspace.');
+      }
+    }
+  }
+}
+
 async function getIdempotencyHit(req, entityType) {
   const key = req.headers['x-idempotency-key'];
   if (!key || typeof key !== 'string') return null;
+  const scopedKey = `BIZ${req.businessId}:${key}`;
   const hit = await dbGet(
-    'SELECT entity_id FROM idempotency_keys WHERE idem_key = ? AND entity_type = ?',
-    [key, entityType]
+    'SELECT entity_id FROM idempotency_keys WHERE idem_key = ? AND business_id = ? AND entity_type = ?',
+    [scopedKey, req.businessId, entityType]
   );
   return hit ? Number(hit.entity_id) : null;
 }
@@ -205,41 +334,48 @@ async function getIdempotencyHit(req, entityType) {
 async function saveIdempotencyKey(req, entityType, entityId) {
   const key = req.headers['x-idempotency-key'];
   if (!key || typeof key !== 'string') return;
+  const scopedKey = `BIZ${req.businessId}:${key}`;
   await dbRun(
-    `INSERT INTO idempotency_keys (idem_key, entity_type, entity_id, created_at)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO idempotency_keys (idem_key, business_id, entity_type, entity_id, created_at)
+     VALUES (?, ?, ?, ?, ?)
      ON CONFLICT (idem_key) DO NOTHING`,
-    [key, entityType, entityId, nowISO()]
+    [scopedKey, req.businessId, entityType, entityId, nowISO()]
   );
 }
 
-async function ensureCustomerForDocument(payload, userId) {
+async function ensureCustomerForDocument(businessId, payload, userId) {
   if (payload.customer_id) {
-    const found = await dbGet('SELECT id FROM customers WHERE id = ?', [
+    const found = await dbGet('SELECT id FROM customers WHERE id = ? AND business_id = ?', [
       Number(payload.customer_id),
+      businessId,
     ]);
-    if (found) return Number(found.id);
+    if (!found) {
+      throw new HttpError(404, 'Selected customer was not found in this business workspace.');
+    }
+    return Number(found.id);
   }
   if (payload.save_as_customer && payload.customer_name?.trim()) {
     const existing = await dbGet(
       `SELECT id FROM customers
-       WHERE LOWER(TRIM(customer_name)) = LOWER(TRIM(?))
+       WHERE business_id = ?
+         AND LOWER(TRIM(customer_name)) = LOWER(TRIM(?))
          AND LOWER(TRIM(company_name)) = LOWER(TRIM(?))
          AND is_archived = 0
        LIMIT 1`,
-      [payload.customer_name.trim(), (payload.company_name || '').trim()]
+      [businessId, payload.customer_name.trim(), (payload.company_name || '').trim()]
     );
 
     if (existing) return Number(existing.id);
 
-    const code = await allocateNextDocNumber('customer');
+    const code = await allocateNextDocNumber(businessId, 'customer');
     const now = nowISO();
     const res = await dbRun(
       `INSERT INTO customers (
-        customer_code, customer_name, company_name, contact_number, email,
+        business_id, customer_code, customer_name, company_name, contact_number, email,
         billing_address, project_locations, remarks, is_archived, created_by, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?)`,
       [
+        businessId,
         code,
         payload.customer_name.trim(),
         (payload.company_name || '').trim(),
@@ -371,6 +507,7 @@ app.post(
     const filename = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${safeExt}`;
 
     const saved = await saveUploadedFile({
+      businessId: req.businessId,
       filename,
       mimeType: req.file.mimetype,
       buffer: req.file.buffer,
@@ -400,7 +537,12 @@ app.post(
     }
     const prefix = rawFilename ? 'img' : 'sig';
     const filename = `${prefix}-${Date.now()}-${crypto.randomBytes(5).toString('hex')}.${ext}`;
-    const saved = await saveUploadedFile({ filename, mimeType, buffer });
+    const saved = await saveUploadedFile({
+      businessId: req.businessId,
+      filename,
+      mimeType,
+      buffer,
+    });
     res.json({ url: saved.url, filename: saved.filename });
   })
 );
@@ -411,8 +553,8 @@ app.post(
 
 app.get(
   '/api/settings',
-  asyncHandler(async (_req, res) => {
-    res.json({ settings: await getSettings(), storage: getStorageStatus() });
+  asyncHandler(async (req, res) => {
+    res.json({ settings: await getSettings(req.businessId), storage: getStorageStatus() });
   })
 );
 
@@ -423,6 +565,17 @@ app.put(
     if (!b.business_name?.trim()) {
       return res.status(400).json({ error: 'Business name is required.' });
     }
+
+    const validatedLogoUrl = await assertAssetUrlBelongsToBusiness(
+      b.logo_url,
+      req.businessId,
+      'Business logo'
+    );
+    const validatedSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.signature_url,
+      req.businessId,
+      'Authorized signature'
+    );
 
     await dbRun(
       `UPDATE business_settings
@@ -459,10 +612,10 @@ app.put(
            tax_label = ?,
            tax_rate = ?,
            updated_at = ?
-       WHERE id = 1`,
+       WHERE id = ? AND business_id = ?`,
       [
         b.business_name.trim(),
-        String(b.logo_url ?? '').trim(),
+        validatedLogoUrl,
         String(b.address ?? '').trim(),
         String(b.contact_number ?? '').trim(),
         String(b.email ?? '').trim(),
@@ -489,23 +642,26 @@ app.put(
         String(b.default_notes ?? '').trim(),
         String(b.authorized_representative ?? '').trim(),
         String(b.authorized_title ?? 'Authorized Representative').trim(),
-        String(b.signature_url ?? '').trim(),
+        validatedSigUrl,
         b.tax_enabled ? 1 : 0,
         String(b.tax_label || 'VAT').trim(),
         Math.max(0, Number(b.tax_rate) || 0),
         nowISO(),
+        req.businessId,
+        req.businessId,
       ]
     );
 
     await logActivity({
+      business_id: req.businessId,
       entity_type: 'settings',
-      entity_id: 1,
+      entity_id: req.businessId,
       action: 'updated',
       summary: 'Updated business profile & document settings',
       actor_name: req.user.full_name,
     });
 
-    res.json({ settings: await getSettings(), storage: getStorageStatus() });
+    res.json({ settings: await getSettings(req.businessId), storage: getStorageStatus() });
   })
 );
 
@@ -515,11 +671,12 @@ app.put(
 
 app.get(
   '/api/dashboard',
-  asyncHandler(async (_req, res) => {
-    await refreshTimeSensitiveStatuses();
+  asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
+    await refreshTimeSensitiveStatuses(bizId);
 
-    const quoteStats = await dbGet(`
-      SELECT
+    const quoteStats = await dbGet(
+      `SELECT
         COUNT(*) as total,
         COALESCE(SUM(CASE WHEN status IN ('Draft', 'Sent') THEN 1 ELSE 0 END), 0) as pending,
         COALESCE(SUM(CASE WHEN status = 'Draft' THEN 1 ELSE 0 END), 0) as draft_count,
@@ -527,11 +684,12 @@ app.get(
         COALESCE(SUM(CASE WHEN status = 'Approved' THEN 1 ELSE 0 END), 0) as approved,
         COALESCE(SUM(grand_total), 0) as total_quoted_amount
       FROM quotations
-      WHERE is_archived = 0
-    `);
+      WHERE business_id = ? AND is_archived = 0`,
+      [bizId]
+    );
 
-    const invoiceStats = await dbGet(`
-      SELECT
+    const invoiceStats = await dbGet(
+      `SELECT
         COUNT(*) as total,
         COALESCE(SUM(CASE WHEN status IN ('Unpaid', 'Partially Paid', 'Overdue') AND remaining_balance > 0.009 THEN 1 ELSE 0 END), 0) as unpaid,
         COALESCE(SUM(CASE WHEN status = 'Unpaid' THEN 1 ELSE 0 END), 0) as strictly_unpaid,
@@ -542,51 +700,60 @@ app.get(
         COALESCE(SUM(amount_paid), 0) as total_collected,
         COALESCE(SUM(remaining_balance), 0) as total_receivables
       FROM invoices
-      WHERE is_archived = 0
-    `);
+      WHERE business_id = ? AND is_archived = 0`,
+      [bizId]
+    );
 
     const stRow = await dbGet(
-      'SELECT COUNT(*) as cnt FROM billing_statements WHERE is_archived = 0'
+      'SELECT COUNT(*) as cnt FROM billing_statements WHERE business_id = ? AND is_archived = 0',
+      [bizId]
     );
     const statementCount = Number(stRow?.cnt || 0);
 
-    const serviceReportStats = await dbGet(`
-      SELECT
+    const serviceReportStats = await dbGet(
+      `SELECT
         COUNT(*) as total,
         COALESCE(SUM(CASE WHEN status IN ('Scheduled', 'In Progress') THEN 1 ELSE 0 END), 0) as active_jobs,
         COALESCE(SUM(CASE WHEN status = 'Completed' THEN 1 ELSE 0 END), 0) as completed_jobs
       FROM service_reports
-      WHERE is_archived = 0
-    `);
+      WHERE business_id = ? AND is_archived = 0`,
+      [bizId]
+    );
 
-    const custRow = await dbGet('SELECT COUNT(*) as cnt FROM customers WHERE is_archived = 0');
+    const custRow = await dbGet(
+      'SELECT COUNT(*) as cnt FROM customers WHERE business_id = ? AND is_archived = 0',
+      [bizId]
+    );
     const customerCount = Number(custRow?.cnt || 0);
 
-    const recentTransactions = await dbAll(`
-      SELECT * FROM (
+    const recentTransactions = await dbAll(
+      `SELECT * FROM (
         SELECT 'quotation' as doc_type, id, quotation_number as doc_number, customer_name, date_issued as doc_date, grand_total as amount, status, created_at
-        FROM quotations WHERE is_archived = 0
+        FROM quotations WHERE business_id = ? AND is_archived = 0
         UNION ALL
         SELECT 'invoice' as doc_type, id, invoice_number as doc_number, customer_name, invoice_date as doc_date, total_amount_due as amount, status, created_at
-        FROM invoices WHERE is_archived = 0
+        FROM invoices WHERE business_id = ? AND is_archived = 0
         UNION ALL
         SELECT 'service_report' as doc_type, id, report_number as doc_number, customer_name, service_date as doc_date, materials_total_cost as amount, status, created_at
-        FROM service_reports WHERE is_archived = 0
+        FROM service_reports WHERE business_id = ? AND is_archived = 0
         UNION ALL
         SELECT 'billing_statement' as doc_type, id, statement_number as doc_number, customer_name, statement_date as doc_date, outstanding_balance as amount, 'Issued' as status, created_at
-        FROM billing_statements WHERE is_archived = 0
+        FROM billing_statements WHERE business_id = ? AND is_archived = 0
       ) AS recent_docs
       ORDER BY created_at DESC
-      LIMIT 12
-    `);
+      LIMIT 12`,
+      [bizId, bizId, bizId, bizId]
+    );
 
-    const recentCustomerActivity = await dbAll(`
-      SELECT *
+    const recentCustomerActivity = await dbAll(
+      `SELECT *
       FROM activity_logs
-      WHERE entity_type IN ('quotation', 'invoice', 'payment', 'service_report', 'billing_statement', 'customer', 'employee', 'payslip', 'coe', 'employee_id')
+      WHERE business_id = ?
+        AND entity_type IN ('quotation', 'invoice', 'payment', 'service_report', 'billing_statement', 'customer', 'employee', 'payslip', 'coe', 'employee_id')
       ORDER BY id DESC
-      LIMIT 15
-    `);
+      LIMIT 15`,
+      [bizId]
+    );
 
     res.json({
       metrics: {
@@ -622,6 +789,7 @@ app.get(
 app.get(
   '/api/search',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const q = String(req.query.q || '').trim();
     if (!q) return res.json({ results: [] });
     const like = `%${q}%`;
@@ -629,73 +797,73 @@ app.get(
     const quotes = await dbAll(
       `SELECT 'quotation' as type, id, quotation_number as title, customer_name as subtitle, status, grand_total as amount
        FROM quotations
-       WHERE is_archived = 0 AND (quotation_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ? OR project_name LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (quotation_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ? OR project_name LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like, like]
+      [bizId, like, like, like, like]
     );
 
     const invoices = await dbAll(
       `SELECT 'invoice' as type, id, invoice_number as title, customer_name as subtitle, status, total_amount_due as amount
        FROM invoices
-       WHERE is_archived = 0 AND (invoice_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ? OR reference_quotation_number LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (invoice_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ? OR reference_quotation_number LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like, like]
+      [bizId, like, like, like, like]
     );
 
     const reports = await dbAll(
       `SELECT 'service_report' as type, id, report_number as title, customer_name as subtitle, status, materials_total_cost as amount
        FROM service_reports
-       WHERE is_archived = 0 AND (report_number LIKE ? OR customer_name LIKE ? OR equipment_serviced LIKE ? OR technician_name LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (report_number LIKE ? OR customer_name LIKE ? OR equipment_serviced LIKE ? OR technician_name LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like, like]
+      [bizId, like, like, like, like]
     );
 
     const statements = await dbAll(
       `SELECT 'billing_statement' as type, id, statement_number as title, customer_name as subtitle, 'Statement' as status, outstanding_balance as amount
        FROM billing_statements
-       WHERE is_archived = 0 AND (statement_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (statement_number LIKE ? OR customer_name LIKE ? OR company_name LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like]
+      [bizId, like, like, like]
     );
 
     const customers = await dbAll(
       `SELECT 'customer' as type, id, customer_name as title, customer_code || CASE WHEN company_name != '' THEN ' • ' || company_name ELSE '' END as subtitle, 'Active' as status, NULL as amount
        FROM customers
-       WHERE is_archived = 0 AND (customer_name LIKE ? OR company_name LIKE ? OR customer_code LIKE ? OR contact_number LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (customer_name LIKE ? OR company_name LIKE ? OR customer_code LIKE ? OR contact_number LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like, like]
+      [bizId, like, like, like, like]
     );
 
     const employees = await dbAll(
       `SELECT 'employee' as type, id, full_name as title, employee_code || ' • ' || position_title as subtitle, CASE WHEN is_active = 1 THEN employment_status ELSE 'Inactive' END as status, NULL as amount
        FROM employees
-       WHERE (full_name LIKE ? OR employee_code LIKE ? OR position_title LIKE ? OR department LIKE ?)
+       WHERE business_id = ? AND (full_name LIKE ? OR employee_code LIKE ? OR position_title LIKE ? OR department LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like, like]
+      [bizId, like, like, like, like]
     );
 
     const payslips = await dbAll(
       `SELECT 'payslip' as type, id, payslip_number as title, employee_name || ' (' || employee_code || ')' as subtitle, status, net_pay as amount
        FROM payslips
-       WHERE is_archived = 0 AND (payslip_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (payslip_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like]
+      [bizId, like, like, like]
     );
 
     const coes = await dbAll(
       `SELECT 'coe' as type, id, certificate_number as title, employee_name || ' • ' || position_title as subtitle, 'Issued' as status, NULL as amount
        FROM certificates_of_employment
-       WHERE is_archived = 0 AND (certificate_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (certificate_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like]
+      [bizId, like, like, like]
     );
 
     const idCards = await dbAll(
       `SELECT 'employee_id' as type, id, employee_code as title, full_name || ' • ' || card_number as subtitle, status, NULL as amount
        FROM employee_id_cards
-       WHERE is_archived = 0 AND (employee_code LIKE ? OR full_name LIKE ? OR card_number LIKE ?)
+       WHERE business_id = ? AND is_archived = 0 AND (employee_code LIKE ? OR full_name LIKE ? OR card_number LIKE ?)
        ORDER BY id DESC LIMIT 6`,
-      [like, like, like]
+      [bizId, like, like, like]
     );
 
     res.json({
@@ -724,8 +892,8 @@ app.get(
     const search = String(req.query.search || '').trim();
     const status = String(req.query.status || 'active');
 
-    let where = 'WHERE 1=1';
-    const params = [];
+    let where = 'WHERE c.business_id = ?';
+    const params = [req.businessId];
     if (status === 'active') where += ' AND c.is_archived = 0';
     else if (status === 'archived') where += ' AND c.is_archived = 1';
 
@@ -737,10 +905,10 @@ app.get(
 
     const customers = await dbAll(
       `SELECT c.*,
-        (SELECT COUNT(*) FROM quotations q WHERE q.customer_id = c.id AND q.is_archived = 0) as quotation_count,
-        (SELECT COUNT(*) FROM invoices i WHERE i.customer_id = c.id AND i.is_archived = 0) as invoice_count,
-        (SELECT COALESCE(SUM(i.total_amount_due), 0) FROM invoices i WHERE i.customer_id = c.id AND i.is_archived = 0) as total_billed,
-        (SELECT COALESCE(SUM(i.remaining_balance), 0) FROM invoices i WHERE i.customer_id = c.id AND i.is_archived = 0) as outstanding_balance
+        (SELECT COUNT(*) FROM quotations q WHERE q.customer_id = c.id AND q.business_id = c.business_id AND q.is_archived = 0) as quotation_count,
+        (SELECT COUNT(*) FROM invoices i WHERE i.customer_id = c.id AND i.business_id = c.business_id AND i.is_archived = 0) as invoice_count,
+        (SELECT COALESCE(SUM(i.total_amount_due), 0) FROM invoices i WHERE i.customer_id = c.id AND i.business_id = c.business_id AND i.is_archived = 0) as total_billed,
+        (SELECT COALESCE(SUM(i.remaining_balance), 0) FROM invoices i WHERE i.customer_id = c.id AND i.business_id = c.business_id AND i.is_archived = 0) as outstanding_balance
        FROM customers c
        ${where}
        ORDER BY c.customer_name ASC, c.id DESC`,
@@ -755,42 +923,46 @@ app.get(
   '/api/customers/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const customer = await dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const customer = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!customer) return res.status(404).json({ error: 'Customer not found.' });
 
-    await refreshTimeSensitiveStatuses();
+    await refreshTimeSensitiveStatuses(bizId);
 
     const quotations = await dbAll(
       `SELECT id, quotation_number, date_issued, valid_until, project_name, grand_total, status, created_at
-       FROM quotations WHERE customer_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
-      [id]
+       FROM quotations WHERE customer_id = ? AND business_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
+      [id, bizId]
     );
 
     const invoices = await dbAll(
       `SELECT id, invoice_number, invoice_date, due_date, total_amount_due, amount_paid, remaining_balance, status, created_at
-       FROM invoices WHERE customer_id = ? AND is_archived = 0 ORDER BY invoice_date DESC, id DESC`,
-      [id]
+       FROM invoices WHERE customer_id = ? AND business_id = ? AND is_archived = 0 ORDER BY invoice_date DESC, id DESC`,
+      [id, bizId]
     );
 
     const payments = await dbAll(
       `SELECT p.*, i.invoice_number
        FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
-       WHERE i.customer_id = ? AND i.is_archived = 0
+       JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
+       WHERE p.business_id = ? AND i.customer_id = ? AND i.is_archived = 0
        ORDER BY p.payment_date DESC, p.id DESC`,
-      [id]
+      [bizId, id]
     );
 
     const service_reports = await dbAll(
       `SELECT id, report_number, service_date, job_type, equipment_serviced, status, materials_total_cost, created_at
-       FROM service_reports WHERE customer_id = ? AND is_archived = 0 ORDER BY service_date DESC, id DESC`,
-      [id]
+       FROM service_reports WHERE customer_id = ? AND business_id = ? AND is_archived = 0 ORDER BY service_date DESC, id DESC`,
+      [id, bizId]
     );
 
     const billing_statements = await dbAll(
       `SELECT id, statement_number, statement_date, period_from, period_to, total_charges, total_payments, outstanding_balance, created_at
-       FROM billing_statements WHERE customer_id = ? AND is_archived = 0 ORDER BY statement_date DESC, id DESC`,
-      [id]
+       FROM billing_statements WHERE customer_id = ? AND business_id = ? AND is_archived = 0 ORDER BY statement_date DESC, id DESC`,
+      [id, bizId]
     );
 
     res.json({
@@ -809,9 +981,13 @@ app.get(
 app.post(
   '/api/customers',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'customer');
     if (idemHit) {
-      const existing = await dbGet('SELECT * FROM customers WHERE id = ?', [idemHit]);
+      const existing = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+        idemHit,
+        bizId,
+      ]);
       if (existing) return res.json({ customer: existing });
     }
 
@@ -821,14 +997,15 @@ app.post(
     }
 
     const created = await runInTransaction(async () => {
-      const code = await allocateNextDocNumber('customer');
+      const code = await allocateNextDocNumber(bizId, 'customer');
       const now = nowISO();
       const info = await dbRun(
         `INSERT INTO customers (
-          customer_code, customer_name, company_name, contact_number, email,
+          business_id, customer_code, customer_name, company_name, contact_number, email,
           billing_address, project_locations, remarks, is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
         [
+          bizId,
           code,
           b.customer_name.trim(),
           String(b.company_name || '').trim(),
@@ -845,6 +1022,7 @@ app.post(
       const id = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'customer', id);
       await logActivity({
+        business_id: bizId,
         entity_type: 'customer',
         entity_id: id,
         document_number: code,
@@ -854,7 +1032,7 @@ app.post(
         summary: `Registered customer ${b.customer_name.trim()} (${code})`,
         actor_name: req.user.full_name,
       });
-      return dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+      return dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [id, bizId]);
     });
 
     res.status(201).json({ customer: created });
@@ -865,7 +1043,11 @@ app.put(
   '/api/customers/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Customer not found.' });
 
     const b = req.body || {};
@@ -883,7 +1065,7 @@ app.put(
            project_locations = ?,
            remarks = ?,
            updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND business_id = ?`,
       [
         b.customer_name.trim(),
         String(b.company_name || '').trim(),
@@ -894,10 +1076,14 @@ app.put(
         String(b.remarks || '').trim(),
         nowISO(),
         id,
+        bizId,
       ]
     );
 
-    const updated = await dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+    const updated = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     res.json({ customer: updated });
   })
 );
@@ -906,17 +1092,21 @@ app.patch(
   '/api/customers/:id/archive',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Customer not found.' });
 
     const archived = req.body?.is_archived ? 1 : 0;
-    await dbRun('UPDATE customers SET is_archived = ?, updated_at = ? WHERE id = ?', [
-      archived,
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE customers SET is_archived = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [archived, nowISO(), id, bizId]
+    );
 
     await logActivity({
+      business_id: bizId,
       entity_type: 'customer',
       entity_id: id,
       document_number: existing.customer_code,
@@ -927,7 +1117,12 @@ app.patch(
       actor_name: req.user.full_name,
     });
 
-    res.json({ customer: await dbGet('SELECT * FROM customers WHERE id = ?', [id]) });
+    res.json({
+      customer: await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+        id,
+        bizId,
+      ]),
+    });
   })
 );
 
@@ -935,16 +1130,20 @@ app.delete(
   '/api/customers/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM customers WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Customer not found.' });
 
     const activeRefs = await dbGet(
       `SELECT
-        (SELECT COUNT(*) FROM quotations WHERE customer_id = ? AND is_archived = 0) as quotes,
-        (SELECT COUNT(*) FROM invoices WHERE customer_id = ? AND is_archived = 0) as invoices,
-        (SELECT COUNT(*) FROM service_reports WHERE customer_id = ? AND is_archived = 0) as reports,
-        (SELECT COUNT(*) FROM billing_statements WHERE customer_id = ? AND is_archived = 0) as statements`,
-      [id, id, id, id]
+        (SELECT COUNT(*) FROM quotations WHERE customer_id = ? AND business_id = ? AND is_archived = 0) as quotes,
+        (SELECT COUNT(*) FROM invoices WHERE customer_id = ? AND business_id = ? AND is_archived = 0) as invoices,
+        (SELECT COUNT(*) FROM service_reports WHERE customer_id = ? AND business_id = ? AND is_archived = 0) as reports,
+        (SELECT COUNT(*) FROM billing_statements WHERE customer_id = ? AND business_id = ? AND is_archived = 0) as statements`,
+      [id, bizId, id, bizId, id, bizId, id, bizId]
     );
 
     const totalActiveRefs =
@@ -960,10 +1159,13 @@ app.delete(
     }
 
     await runInTransaction(async () => {
-      // Remove any archived billing statements whose FK ON DELETE RESTRICT would block deletion
-      await dbRun('DELETE FROM billing_statements WHERE customer_id = ? AND is_archived = 1', [id]);
-      await dbRun('DELETE FROM customers WHERE id = ?', [id]);
+      await dbRun(
+        'DELETE FROM billing_statements WHERE customer_id = ? AND business_id = ? AND is_archived = 1',
+        [id, bizId]
+      );
+      await dbRun('DELETE FROM customers WHERE id = ? AND business_id = ?', [id, bizId]);
       await logActivity({
+        business_id: bizId,
         entity_type: 'customer',
         entity_id: id,
         document_number: existing.customer_code,
@@ -990,8 +1192,8 @@ app.get(
     const category = String(req.query.category || '');
     const status = String(req.query.status || 'active');
 
-    let where = 'WHERE 1=1';
-    const params = [];
+    let where = 'WHERE business_id = ?';
+    const params = [req.businessId];
     if (status === 'active') where += ' AND is_archived = 0';
     else if (status === 'archived') where += ' AND is_archived = 1';
 
@@ -1017,9 +1219,13 @@ app.get(
 app.post(
   '/api/products',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'product');
     if (idemHit) {
-      const existing = await dbGet('SELECT * FROM products_services WHERE id = ?', [idemHit]);
+      const existing = await dbGet(
+        'SELECT * FROM products_services WHERE id = ? AND business_id = ?',
+        [idemHit, bizId]
+      );
       if (existing) return res.json({ product: existing });
     }
 
@@ -1029,13 +1235,14 @@ app.post(
     }
 
     const product = await runInTransaction(async () => {
-      const code = await allocateNextDocNumber('product');
+      const code = await allocateNextDocNumber(bizId, 'product');
       const now = nowISO();
       const info = await dbRun(
         `INSERT INTO products_services (
-          item_code, name, description, category, material_grade, unit, unit_price, is_archived, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          business_id, item_code, name, description, category, material_grade, unit, unit_price, is_archived, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         [
+          bizId,
           code,
           b.name.trim(),
           String(b.description || '').trim(),
@@ -1049,7 +1256,10 @@ app.post(
       );
       const id = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'product', id);
-      return dbGet('SELECT * FROM products_services WHERE id = ?', [id]);
+      return dbGet('SELECT * FROM products_services WHERE id = ? AND business_id = ?', [
+        id,
+        bizId,
+      ]);
     });
 
     res.status(201).json({ product });
@@ -1060,7 +1270,11 @@ app.put(
   '/api/products/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM products_services WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM products_services WHERE id = ? AND business_id = ?',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Item not found.' });
 
     const b = req.body || {};
@@ -1071,7 +1285,7 @@ app.put(
     await dbRun(
       `UPDATE products_services
        SET name = ?, description = ?, category = ?, material_grade = ?, unit = ?, unit_price = ?, is_archived = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND business_id = ?`,
       [
         b.name.trim(),
         String(b.description || '').trim(),
@@ -1082,10 +1296,16 @@ app.put(
         b.is_archived !== undefined ? (b.is_archived ? 1 : 0) : existing.is_archived,
         nowISO(),
         id,
+        bizId,
       ]
     );
 
-    res.json({ product: await dbGet('SELECT * FROM products_services WHERE id = ?', [id]) });
+    res.json({
+      product: await dbGet('SELECT * FROM products_services WHERE id = ? AND business_id = ?', [
+        id,
+        bizId,
+      ]),
+    });
   })
 );
 
@@ -1093,16 +1313,24 @@ app.patch(
   '/api/products/:id/archive',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM products_services WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM products_services WHERE id = ? AND business_id = ?',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Item not found.' });
 
     const archived = req.body?.is_archived ? 1 : 0;
-    await dbRun('UPDATE products_services SET is_archived = ?, updated_at = ? WHERE id = ?', [
-      archived,
-      nowISO(),
-      id,
-    ]);
-    res.json({ product: await dbGet('SELECT * FROM products_services WHERE id = ?', [id]) });
+    await dbRun(
+      'UPDATE products_services SET is_archived = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [archived, nowISO(), id, bizId]
+    );
+    res.json({
+      product: await dbGet('SELECT * FROM products_services WHERE id = ? AND business_id = ?', [
+        id,
+        bizId,
+      ]),
+    });
   })
 );
 
@@ -1110,10 +1338,14 @@ app.delete(
   '/api/products/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM products_services WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM products_services WHERE id = ? AND business_id = ?',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Item not found.' });
 
-    await dbRun('DELETE FROM products_services WHERE id = ?', [id]);
+    await dbRun('DELETE FROM products_services WHERE id = ? AND business_id = ?', [id, bizId]);
     res.json({ ok: true });
   })
 );
@@ -1122,8 +1354,11 @@ app.delete(
 // QUOTATIONS MODULE
 // ============================================================================
 
-async function getFullQuotation(id) {
-  const quotation = await dbGet('SELECT * FROM quotations WHERE id = ? AND is_archived = 0', [id]);
+async function getFullQuotation(businessId, id) {
+  const quotation = await dbGet(
+    'SELECT * FROM quotations WHERE id = ? AND business_id = ? AND is_archived = 0',
+    [id, businessId]
+  );
   if (!quotation) return null;
   const items = await dbAll(
     'SELECT * FROM quotation_items WHERE quotation_id = ? ORDER BY sort_order ASC, id ASC',
@@ -1133,8 +1368,8 @@ async function getFullQuotation(id) {
   let converted_invoice_number = '';
   if (converted_invoice_id) {
     const inv = await dbGet(
-      'SELECT id, invoice_number FROM invoices WHERE id = ? AND is_archived = 0',
-      [converted_invoice_id]
+      'SELECT id, invoice_number FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [converted_invoice_id, businessId]
     );
     if (inv) {
       converted_invoice_number = inv.invoice_number;
@@ -1149,21 +1384,22 @@ app.get(
   '/api/quotations/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('quotation', dateStr) });
+    res.json({ next_number: await previewNextDocNumber(req.businessId, 'quotation', dateStr) });
   })
 );
 
 app.get(
   '/api/quotations',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
+    const bizId = req.businessId;
+    await refreshTimeSensitiveStatuses(bizId);
     const search = String(req.query.search || '').trim();
     const status = String(req.query.status || 'all');
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [bizId];
     if (status && status !== 'all') {
       if (status === 'Pending') {
         where += ` AND status IN ('Draft', 'Sent')`;
@@ -1198,8 +1434,8 @@ app.get(
 app.get(
   '/api/quotations/:id',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
-    const full = await getFullQuotation(Number(req.params.id));
+    await refreshTimeSensitiveStatuses(req.businessId);
+    const full = await getFullQuotation(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Quotation not found.' });
     res.json({ quotation: full });
   })
@@ -1208,9 +1444,10 @@ app.get(
 app.post(
   '/api/quotations',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'quotation');
     if (idemHit) {
-      const existing = await getFullQuotation(idemHit);
+      const existing = await getFullQuotation(bizId, idemHit);
       if (existing) return res.json({ quotation: existing });
     }
 
@@ -1235,25 +1472,28 @@ app.post(
         .json({ error: 'Please add at least one line item with a description.' });
     }
 
+    await assertProductsBelongToBusiness(calc.items, bizId);
+
     const validStatuses = ['Draft', 'Sent', 'Approved', 'Rejected', 'Expired'];
     const status = validStatuses.includes(b.status) ? b.status : 'Draft';
 
     const createdId = await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
-      const qNumber = await allocateNextDocNumber('quotation', b.date_issued);
-      const settings = await getSettings();
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
+      const qNumber = await allocateNextDocNumber(bizId, 'quotation', b.date_issued);
+      const settings = await getSettings(bizId);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO quotations (
-          quotation_number, date_issued, valid_until, customer_id, customer_name, company_name,
+          business_id, quotation_number, date_issued, valid_until, customer_id, customer_name, company_name,
           customer_address, contact_number, customer_email, project_name, project_location,
           subtotal, discount_type, discount_value, discount_amount,
           tax_enabled, tax_label, tax_rate, tax_amount, grand_total,
           payment_terms, delivery_schedule, remarks, prepared_by, authorized_signatory,
           status, is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
         [
+          bizId,
           qNumber,
           b.date_issued,
           String(b.valid_until || '').trim(),
@@ -1306,6 +1546,7 @@ app.post(
 
       await saveIdempotencyKey(req, 'quotation', qId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'quotation',
         entity_id: qId,
         document_number: qNumber,
@@ -1320,7 +1561,7 @@ app.post(
       return qId;
     });
 
-    res.status(201).json({ quotation: await getFullQuotation(createdId) });
+    res.status(201).json({ quotation: await getFullQuotation(bizId, createdId) });
   })
 );
 
@@ -1328,9 +1569,11 @@ app.put(
   '/api/quotations/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM quotations WHERE id = ? AND is_archived = 0', [
-      id,
-    ]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM quotations WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
 
     const b = req.body || {};
@@ -1349,12 +1592,14 @@ app.put(
       return res.status(400).json({ error: 'Please include at least one line item.' });
     }
 
+    await assertProductsBelongToBusiness(calc.items, bizId);
+
     const validStatuses = ['Draft', 'Sent', 'Approved', 'Rejected', 'Expired'];
     const status = validStatuses.includes(b.status) ? b.status : existing.status;
 
     await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
-      const settings = await getSettings();
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
+      const settings = await getSettings(bizId);
       await dbRun(
         `UPDATE quotations
          SET date_issued = ?, valid_until = ?, customer_id = ?, customer_name = ?, company_name = ?,
@@ -1363,7 +1608,7 @@ app.put(
              tax_enabled = ?, tax_label = ?, tax_rate = ?, tax_amount = ?, grand_total = ?,
              payment_terms = ?, delivery_schedule = ?, remarks = ?, prepared_by = ?, authorized_signatory = ?,
              status = ?, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND business_id = ?`,
         [
           b.date_issued || existing.date_issued,
           String(b.valid_until ?? '').trim(),
@@ -1392,6 +1637,7 @@ app.put(
           status,
           nowISO(),
           id,
+          bizId,
         ]
       );
 
@@ -1414,6 +1660,7 @@ app.put(
       }
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'quotation',
         entity_id: id,
         document_number: existing.quotation_number,
@@ -1426,7 +1673,7 @@ app.put(
       });
     });
 
-    res.json({ quotation: await getFullQuotation(id) });
+    res.json({ quotation: await getFullQuotation(bizId, id) });
   })
 );
 
@@ -1434,9 +1681,11 @@ app.patch(
   '/api/quotations/:id/status',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM quotations WHERE id = ? AND is_archived = 0', [
-      id,
-    ]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM quotations WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
 
     const { status } = req.body || {};
@@ -1445,13 +1694,13 @@ app.patch(
       return res.status(400).json({ error: 'Invalid quotation status.' });
     }
 
-    await dbRun('UPDATE quotations SET status = ?, updated_at = ? WHERE id = ?', [
-      status,
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE quotations SET status = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [status, nowISO(), id, bizId]
+    );
 
     await logActivity({
+      business_id: bizId,
       entity_type: 'quotation',
       entity_id: id,
       document_number: existing.quotation_number,
@@ -1463,7 +1712,7 @@ app.patch(
       actor_name: req.user.full_name,
     });
 
-    res.json({ quotation: await getFullQuotation(id) });
+    res.json({ quotation: await getFullQuotation(bizId, id) });
   })
 );
 
@@ -1471,7 +1720,8 @@ app.post(
   '/api/quotations/:id/convert-to-invoice',
   asyncHandler(async (req, res) => {
     const qId = Number(req.params.id);
-    const fullQuote = await getFullQuotation(qId);
+    const bizId = req.businessId;
+    const fullQuote = await getFullQuotation(bizId, qId);
     if (!fullQuote) return res.status(404).json({ error: 'Quotation not found.' });
 
     if (fullQuote.status !== 'Approved') {
@@ -1483,8 +1733,8 @@ app.post(
 
     if (fullQuote.converted_invoice_id && !req.body?.allow_additional) {
       const existingInv = await dbGet(
-        'SELECT id, invoice_number FROM invoices WHERE id = ? AND is_archived = 0',
-        [fullQuote.converted_invoice_id]
+        'SELECT id, invoice_number FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+        [fullQuote.converted_invoice_id, bizId]
       );
       if (existingInv) {
         return res.status(409).json({
@@ -1496,27 +1746,28 @@ app.post(
     }
 
     const createdInvoiceId = await runInTransaction(async () => {
-      const settings = await getSettings();
+      const settings = await getSettings(bizId);
       const invDate = todayYMD();
       const dueDays = Number(settings.default_invoice_due_days) || 15;
       const dueObj = new Date(`${invDate}T00:00:00Z`);
       dueObj.setUTCDate(dueObj.getUTCDate() + dueDays);
       const dueDate = dueObj.toISOString().slice(0, 10);
 
-      const invNumber = await allocateNextDocNumber('invoice', invDate);
+      const invNumber = await allocateNextDocNumber(bizId, 'invoice', invDate);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO invoices (
-          invoice_number, invoice_date, due_date, customer_id, customer_name, company_name,
+          business_id, invoice_number, invoice_date, due_date, customer_id, customer_name, company_name,
           customer_address, contact_number, customer_email, quotation_id, reference_quotation_number,
           project_name, subtotal, discount_type, discount_value, discount_amount,
           tax_enabled, tax_label, tax_rate, tax_amount, total_amount_due,
           amount_paid, remaining_balance, payment_method, payment_date,
           payment_terms, remarks, prepared_by, authorized_signatory,
           status, is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, ?, 'Unpaid', 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, ?, 'Unpaid', 0, ?, ?, ?)`,
         [
+          bizId,
           invNumber,
           invDate,
           dueDate,
@@ -1568,11 +1819,12 @@ app.post(
       }
 
       await dbRun(
-        'UPDATE quotations SET converted_invoice_id = ?, updated_at = ? WHERE id = ?',
-        [invId, now, fullQuote.id]
+        'UPDATE quotations SET converted_invoice_id = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+        [invId, now, fullQuote.id, bizId]
       );
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'invoice',
         entity_id: invId,
         document_number: invNumber,
@@ -1587,7 +1839,7 @@ app.post(
       return invId;
     });
 
-    res.status(201).json({ invoice: await getFullInvoice(createdInvoiceId) });
+    res.status(201).json({ invoice: await getFullInvoice(bizId, createdInvoiceId) });
   })
 );
 
@@ -1595,15 +1847,18 @@ app.delete(
   '/api/quotations/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM quotations WHERE id = ? AND is_archived = 0', [
-      id,
-    ]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM quotations WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Quotation not found.' });
-    await dbRun('UPDATE quotations SET is_archived = 1, updated_at = ? WHERE id = ?', [
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE quotations SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
+    );
     await logActivity({
+      business_id: bizId,
       entity_type: 'quotation',
       entity_id: id,
       document_number: existing.quotation_number,
@@ -1620,9 +1875,9 @@ app.delete(
 app.get(
   '/api/quotations/:id/pdf',
   asyncHandler(async (req, res) => {
-    const full = await getFullQuotation(Number(req.params.id));
+    const full = await getFullQuotation(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Quotation not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateQuotationPdf(full, full.items, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${full.quotation_number}.pdf"`);
@@ -1634,16 +1889,19 @@ app.get(
 // INVOICES & PAYMENTS MODULE
 // ============================================================================
 
-async function getFullInvoice(id) {
-  const invoice = await dbGet('SELECT * FROM invoices WHERE id = ? AND is_archived = 0', [id]);
+async function getFullInvoice(businessId, id) {
+  const invoice = await dbGet(
+    'SELECT * FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+    [id, businessId]
+  );
   if (!invoice) return null;
   const items = await dbAll(
     'SELECT * FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC, id ASC',
     [id]
   );
   const payments = await dbAll(
-    'SELECT * FROM payments WHERE invoice_id = ? ORDER BY payment_date DESC, id DESC',
-    [id]
+    'SELECT * FROM payments WHERE invoice_id = ? AND business_id = ? ORDER BY payment_date DESC, id DESC',
+    [id, businessId]
   );
   return { ...invoice, items, payments };
 }
@@ -1652,22 +1910,23 @@ app.get(
   '/api/invoices/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('invoice', dateStr) });
+    res.json({ next_number: await previewNextDocNumber(req.businessId, 'invoice', dateStr) });
   })
 );
 
 app.get(
   '/api/invoices',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
+    const bizId = req.businessId;
+    await refreshTimeSensitiveStatuses(bizId);
     const search = String(req.query.search || '').trim();
     const status = String(req.query.status || 'all');
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
     const customerId = req.query.customer_id ? Number(req.query.customer_id) : null;
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [bizId];
 
     if (customerId) {
       where += ' AND customer_id = ?';
@@ -1707,8 +1966,8 @@ app.get(
 app.get(
   '/api/invoices/:id',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
-    const full = await getFullInvoice(Number(req.params.id));
+    await refreshTimeSensitiveStatuses(req.businessId);
+    const full = await getFullInvoice(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Invoice not found.' });
     res.json({ invoice: full });
   })
@@ -1717,9 +1976,10 @@ app.get(
 app.post(
   '/api/invoices',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'invoice');
     if (idemHit) {
-      const existing = await getFullInvoice(idemHit);
+      const existing = await getFullInvoice(bizId, idemHit);
       if (existing) return res.json({ invoice: existing });
     }
 
@@ -1742,28 +2002,43 @@ app.post(
       return res.status(400).json({ error: 'Please add at least one line item.' });
     }
 
+    await assertProductsBelongToBusiness(calc.items, bizId);
+
+    let linkedQuotationId = null;
+    if (b.quotation_id) {
+      const qRow = await dbGet(
+        'SELECT id FROM quotations WHERE id = ? AND business_id = ?',
+        [Number(b.quotation_id), bizId]
+      );
+      if (!qRow) {
+        return res.status(404).json({ error: 'Referenced quotation was not found in this business workspace.' });
+      }
+      linkedQuotationId = Number(qRow.id);
+    }
+
     const initialPayment = Math.max(0, round2(b.initial_payment_amount || 0));
     if (initialPayment > calc.grand_total + 0.01) {
       return res.status(400).json({ error: 'Initial payment cannot exceed total amount due.' });
     }
 
     const createdId = await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
-      const invNumber = await allocateNextDocNumber('invoice', b.invoice_date);
-      const settings = await getSettings();
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
+      const invNumber = await allocateNextDocNumber(bizId, 'invoice', b.invoice_date);
+      const settings = await getSettings(bizId);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO invoices (
-          invoice_number, invoice_date, due_date, customer_id, customer_name, company_name,
+          business_id, invoice_number, invoice_date, due_date, customer_id, customer_name, company_name,
           customer_address, contact_number, customer_email, quotation_id, reference_quotation_number,
           project_name, subtotal, discount_type, discount_value, discount_amount,
           tax_enabled, tax_label, tax_rate, tax_amount, total_amount_due,
           amount_paid, remaining_balance, payment_method, payment_date,
           payment_terms, remarks, prepared_by, authorized_signatory,
           status, is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, ?, 'Unpaid', 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, ?, 'Unpaid', 0, ?, ?, ?)`,
         [
+          bizId,
           invNumber,
           b.invoice_date,
           String(b.due_date || '').trim(),
@@ -1773,7 +2048,7 @@ app.post(
           String(b.customer_address || '').trim(),
           String(b.contact_number || '').trim(),
           String(b.customer_email || '').trim(),
-          b.quotation_id ? Number(b.quotation_id) : null,
+          linkedQuotationId,
           String(b.reference_quotation_number || '').trim(),
           String(b.project_name || '').trim(),
           calc.subtotal,
@@ -1815,13 +2090,18 @@ app.post(
       }
 
       if (initialPayment > 0) {
-        const payNo = await allocateNextDocNumber('payment', b.payment_date || b.invoice_date);
+        const payNo = await allocateNextDocNumber(
+          bizId,
+          'payment',
+          b.payment_date || b.invoice_date
+        );
         await dbRun(
           `INSERT INTO payments (
-            payment_number, invoice_id, customer_id, payment_date, amount,
+            business_id, payment_number, invoice_id, customer_id, payment_date, amount,
             payment_method, reference_number, notes, recorded_by, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
+            bizId,
             payNo,
             invId,
             customerId,
@@ -1837,10 +2117,11 @@ app.post(
         );
       }
 
-      await recalculateInvoicePaymentState(invId);
+      await recalculateInvoicePaymentState(bizId, invId);
       await saveIdempotencyKey(req, 'invoice', invId);
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'invoice',
         entity_id: invId,
         document_number: invNumber,
@@ -1854,6 +2135,7 @@ app.post(
 
       if (initialPayment > 0) {
         await logActivity({
+          business_id: bizId,
           entity_type: 'payment',
           entity_id: invId,
           document_number: invNumber,
@@ -1871,7 +2153,7 @@ app.post(
       return invId;
     });
 
-    res.status(201).json({ invoice: await getFullInvoice(createdId) });
+    res.status(201).json({ invoice: await getFullInvoice(bizId, createdId) });
   })
 );
 
@@ -1879,7 +2161,11 @@ app.put(
   '/api/invoices/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM invoices WHERE id = ? AND is_archived = 0', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Invoice not found.' });
 
     const b = req.body || {};
@@ -1898,6 +2184,8 @@ app.put(
       return res.status(400).json({ error: 'Please include at least one line item.' });
     }
 
+    await assertProductsBelongToBusiness(calc.items, bizId);
+
     if (calc.grand_total + 0.01 < Number(existing.amount_paid || 0)) {
       return res.status(400).json({
         error: `Total amount due (₱${calc.grand_total.toFixed(
@@ -1909,8 +2197,8 @@ app.put(
     }
 
     await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
-      const settings = await getSettings();
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
+      const settings = await getSettings(bizId);
 
       await dbRun(
         `UPDATE invoices
@@ -1919,7 +2207,7 @@ app.put(
              project_name = ?, subtotal = ?, discount_type = ?, discount_value = ?, discount_amount = ?,
              tax_enabled = ?, tax_label = ?, tax_rate = ?, tax_amount = ?, total_amount_due = ?,
              payment_terms = ?, remarks = ?, prepared_by = ?, authorized_signatory = ?, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND business_id = ?`,
         [
           b.invoice_date || existing.invoice_date,
           String(b.due_date ?? '').trim(),
@@ -1946,6 +2234,7 @@ app.put(
           String(b.authorized_signatory ?? '').trim(),
           nowISO(),
           id,
+          bizId,
         ]
       );
 
@@ -1967,10 +2256,15 @@ app.put(
         );
       }
 
-      await dbRun('UPDATE payments SET customer_id = ? WHERE invoice_id = ?', [customerId, id]);
-      await recalculateInvoicePaymentState(id);
+      await dbRun('UPDATE payments SET customer_id = ? WHERE invoice_id = ? AND business_id = ?', [
+        customerId,
+        id,
+        bizId,
+      ]);
+      await recalculateInvoicePaymentState(bizId, id);
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'invoice',
         entity_id: id,
         document_number: existing.invoice_number,
@@ -1983,7 +2277,7 @@ app.put(
       });
     });
 
-    res.json({ invoice: await getFullInvoice(id) });
+    res.json({ invoice: await getFullInvoice(bizId, id) });
   })
 );
 
@@ -1991,12 +2285,16 @@ app.post(
   '/api/invoices/:id/payments',
   asyncHandler(async (req, res) => {
     const invoiceId = Number(req.params.id);
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'payment');
     if (idemHit) {
-      return res.json({ invoice: await getFullInvoice(invoiceId) });
+      return res.json({ invoice: await getFullInvoice(bizId, invoiceId) });
     }
 
-    const inv = await dbGet('SELECT * FROM invoices WHERE id = ? AND is_archived = 0', [invoiceId]);
+    const inv = await dbGet(
+      'SELECT * FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [invoiceId, bizId]
+    );
     if (!inv) return res.status(404).json({ error: 'Invoice not found.' });
 
     const b = req.body || {};
@@ -2016,14 +2314,15 @@ app.post(
     const method = String(b.payment_method || 'Cash').trim();
 
     await runInTransaction(async () => {
-      const payNo = await allocateNextDocNumber('payment', payDate);
+      const payNo = await allocateNextDocNumber(bizId, 'payment', payDate);
       const now = nowISO();
       const info = await dbRun(
         `INSERT INTO payments (
-          payment_number, invoice_id, customer_id, payment_date, amount,
+          business_id, payment_number, invoice_id, customer_id, payment_date, amount,
           payment_method, reference_number, notes, recorded_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
+          bizId,
           payNo,
           invoiceId,
           inv.customer_id,
@@ -2039,10 +2338,11 @@ app.post(
       );
 
       const payId = Number(info.lastInsertRowid);
-      await recalculateInvoicePaymentState(invoiceId);
+      await recalculateInvoicePaymentState(bizId, invoiceId);
       await saveIdempotencyKey(req, 'payment', payId);
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'payment',
         entity_id: invoiceId,
         document_number: inv.invoice_number,
@@ -2055,20 +2355,21 @@ app.post(
       });
     });
 
-    res.status(201).json({ invoice: await getFullInvoice(invoiceId) });
+    res.status(201).json({ invoice: await getFullInvoice(bizId, invoiceId) });
   })
 );
 
 app.get(
   '/api/payments',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const search = String(req.query.search || '').trim();
     const method = String(req.query.method || 'all');
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
 
-    let where = 'WHERE i.is_archived = 0';
-    const params = [];
+    let where = 'WHERE p.business_id = ? AND i.is_archived = 0';
+    const params = [bizId];
     if (method && method !== 'all') {
       where += ' AND p.payment_method = ?';
       params.push(method);
@@ -2091,7 +2392,7 @@ app.get(
     const payments = await dbAll(
       `SELECT p.*, i.invoice_number, i.customer_name, i.company_name, i.total_amount_due, i.remaining_balance, i.status as invoice_status
        FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
+       JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
        ${where}
        ORDER BY p.payment_date DESC, p.id DESC`,
       params
@@ -2105,18 +2406,23 @@ app.delete(
   '/api/payments/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const payment = await dbGet('SELECT * FROM payments WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const payment = await dbGet('SELECT * FROM payments WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!payment) return res.status(404).json({ error: 'Payment record not found.' });
 
     await runInTransaction(async () => {
       const inv = await dbGet(
-        'SELECT invoice_number, customer_name, customer_id FROM invoices WHERE id = ?',
-        [payment.invoice_id]
+        'SELECT invoice_number, customer_name, customer_id FROM invoices WHERE id = ? AND business_id = ?',
+        [payment.invoice_id, bizId]
       );
-      await dbRun('DELETE FROM payments WHERE id = ?', [id]);
-      await recalculateInvoicePaymentState(payment.invoice_id);
+      await dbRun('DELETE FROM payments WHERE id = ? AND business_id = ?', [id, bizId]);
+      await recalculateInvoicePaymentState(bizId, payment.invoice_id);
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'payment',
         entity_id: payment.invoice_id,
         document_number: inv?.invoice_number || payment.payment_number,
@@ -2131,7 +2437,7 @@ app.delete(
       });
     });
 
-    res.json({ ok: true, invoice: await getFullInvoice(payment.invoice_id) });
+    res.json({ ok: true, invoice: await getFullInvoice(bizId, payment.invoice_id) });
   })
 );
 
@@ -2139,17 +2445,25 @@ app.delete(
   '/api/invoices/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM invoices WHERE id = ? AND is_archived = 0', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM invoices WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Invoice not found.' });
 
     await runInTransaction(async () => {
       const now = nowISO();
-      await dbRun('UPDATE invoices SET is_archived = 1, updated_at = ? WHERE id = ?', [now, id]);
       await dbRun(
-        'UPDATE quotations SET converted_invoice_id = NULL, updated_at = ? WHERE converted_invoice_id = ?',
-        [now, id]
+        'UPDATE invoices SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+        [now, id, bizId]
+      );
+      await dbRun(
+        'UPDATE quotations SET converted_invoice_id = NULL, updated_at = ? WHERE converted_invoice_id = ? AND business_id = ?',
+        [now, id, bizId]
       );
       await logActivity({
+        business_id: bizId,
         entity_type: 'invoice',
         entity_id: id,
         document_number: existing.invoice_number,
@@ -2168,10 +2482,10 @@ app.delete(
 app.get(
   '/api/invoices/:id/pdf',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
-    const full = await getFullInvoice(Number(req.params.id));
+    await refreshTimeSensitiveStatuses(req.businessId);
+    const full = await getFullInvoice(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Invoice not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateInvoicePdf(full, full.items, full.payments, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${full.invoice_number}.pdf"`);
@@ -2183,10 +2497,11 @@ app.get(
 // SERVICE REPORTS MODULE
 // ============================================================================
 
-async function getFullServiceReport(id) {
-  const report = await dbGet('SELECT * FROM service_reports WHERE id = ? AND is_archived = 0', [
-    id,
-  ]);
+async function getFullServiceReport(businessId, id) {
+  const report = await dbGet(
+    'SELECT * FROM service_reports WHERE id = ? AND business_id = ? AND is_archived = 0',
+    [id, businessId]
+  );
   if (!report) return null;
   const materials = await dbAll(
     'SELECT * FROM service_report_materials WHERE service_report_id = ? ORDER BY sort_order ASC, id ASC',
@@ -2203,7 +2518,9 @@ app.get(
   '/api/service-reports/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('service_report', dateStr) });
+    res.json({
+      next_number: await previewNextDocNumber(req.businessId, 'service_report', dateStr),
+    });
   })
 );
 
@@ -2215,8 +2532,8 @@ app.get(
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [req.businessId];
     if (status && status !== 'all') {
       where += ' AND status = ?';
       params.push(status);
@@ -2247,7 +2564,7 @@ app.get(
 app.get(
   '/api/service-reports/:id',
   asyncHandler(async (req, res) => {
-    const full = await getFullServiceReport(Number(req.params.id));
+    const full = await getFullServiceReport(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Service report not found.' });
     res.json({ service_report: full });
   })
@@ -2256,9 +2573,10 @@ app.get(
 app.post(
   '/api/service-reports',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'service_report');
     if (idemHit) {
-      const existing = await getFullServiceReport(idemHit);
+      const existing = await getFullServiceReport(bizId, idemHit);
       if (existing) return res.json({ service_report: existing });
     }
 
@@ -2268,6 +2586,33 @@ app.post(
     }
     if (!b.service_date) {
       return res.status(400).json({ error: 'Service date is required.' });
+    }
+
+    const techSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.technician_signature_url,
+      bizId,
+      'Technician signature'
+    );
+    const custSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.customer_signature_url,
+      bizId,
+      'Customer signature'
+    );
+
+    const validatedPhotos = [];
+    for (const p of Array.isArray(b.photos) ? b.photos : []) {
+      if (p?.photo_url) {
+        const cleanPhotoUrl = await assertAssetUrlBelongsToBusiness(
+          p.photo_url,
+          bizId,
+          'Service report photo'
+        );
+        validatedPhotos.push({
+          photo_type: p.photo_type === 'after' ? 'after' : 'before',
+          photo_url: cleanPhotoUrl,
+          caption: String(p.caption || '').trim(),
+        });
+      }
     }
 
     const materials = (Array.isArray(b.materials) ? b.materials : [])
@@ -2290,20 +2635,21 @@ app.post(
     const status = validStatuses.includes(b.status) ? b.status : 'Scheduled';
 
     const createdId = await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
-      const rNumber = await allocateNextDocNumber('service_report', b.service_date);
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
+      const rNumber = await allocateNextDocNumber(bizId, 'service_report', b.service_date);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO service_reports (
-          report_number, service_date, job_type, customer_id, customer_name, company_name,
+          business_id, report_number, service_date, job_type, customer_id, customer_name, company_name,
           contact_details, service_location, equipment_serviced, reported_problem,
           inspection_findings, work_performed, materials_total_cost, technician_name,
           start_time, completion_time, status, recommendations, customer_acknowledgment,
           customer_signatory_name, acknowledgment_date, technician_signature_url,
           customer_signature_url, remarks, is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
         [
+          bizId,
           rNumber,
           b.service_date,
           String(b.job_type || 'Fabrication').trim(),
@@ -2325,8 +2671,8 @@ app.post(
           b.customer_acknowledgment ? 1 : 0,
           String(b.customer_signatory_name || '').trim(),
           String(b.acknowledgment_date || '').trim(),
-          String(b.technician_signature_url || '').trim(),
-          String(b.customer_signature_url || '').trim(),
+          techSigUrl,
+          custSigUrl,
           String(b.remarks || '').trim(),
           req.user.id,
           now,
@@ -2343,25 +2689,17 @@ app.post(
         );
       }
 
-      const photos = Array.isArray(b.photos) ? b.photos : [];
-      for (const p of photos) {
-        if (p?.photo_url) {
-          await dbRun(
-            `INSERT INTO service_report_photos (service_report_id, photo_type, photo_url, caption, created_at)
-             VALUES (?, ?, ?, ?, ?)`,
-            [
-              srId,
-              p.photo_type === 'after' ? 'after' : 'before',
-              String(p.photo_url).trim(),
-              String(p.caption || '').trim(),
-              now,
-            ]
-          );
-        }
+      for (const p of validatedPhotos) {
+        await dbRun(
+          `INSERT INTO service_report_photos (service_report_id, photo_type, photo_url, caption, created_at)
+           VALUES (?, ?, ?, ?, ?)`,
+          [srId, p.photo_type, p.photo_url, p.caption, now]
+        );
       }
 
       await saveIdempotencyKey(req, 'service_report', srId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'service_report',
         entity_id: srId,
         document_number: rNumber,
@@ -2376,7 +2714,7 @@ app.post(
       return srId;
     });
 
-    res.status(201).json({ service_report: await getFullServiceReport(createdId) });
+    res.status(201).json({ service_report: await getFullServiceReport(bizId, createdId) });
   })
 );
 
@@ -2384,14 +2722,46 @@ app.put(
   '/api/service-reports/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM service_reports WHERE id = ? AND is_archived = 0', [
-      id,
-    ]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM service_reports WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Service report not found.' });
 
     const b = req.body || {};
     if (!b.customer_name?.trim()) {
       return res.status(400).json({ error: 'Customer name is required.' });
+    }
+
+    const techSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.technician_signature_url,
+      bizId,
+      'Technician signature'
+    );
+    const custSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.customer_signature_url,
+      bizId,
+      'Customer signature'
+    );
+
+    let validatedPhotos = null;
+    if (Array.isArray(b.photos)) {
+      validatedPhotos = [];
+      for (const p of b.photos) {
+        if (p?.photo_url) {
+          const cleanPhotoUrl = await assertAssetUrlBelongsToBusiness(
+            p.photo_url,
+            bizId,
+            'Service report photo'
+          );
+          validatedPhotos.push({
+            photo_type: p.photo_type === 'after' ? 'after' : 'before',
+            photo_url: cleanPhotoUrl,
+            caption: String(p.caption || '').trim(),
+          });
+        }
+      }
     }
 
     const materials = (Array.isArray(b.materials) ? b.materials : [])
@@ -2414,7 +2784,7 @@ app.put(
     const status = validStatuses.includes(b.status) ? b.status : existing.status;
 
     await runInTransaction(async () => {
-      const customerId = await ensureCustomerForDocument(b, req.user.id);
+      const customerId = await ensureCustomerForDocument(bizId, b, req.user.id);
       const now = nowISO();
 
       await dbRun(
@@ -2425,7 +2795,7 @@ app.put(
              start_time = ?, completion_time = ?, status = ?, recommendations = ?, customer_acknowledgment = ?,
              customer_signatory_name = ?, acknowledgment_date = ?, technician_signature_url = ?,
              customer_signature_url = ?, remarks = ?, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND business_id = ?`,
         [
           b.service_date || existing.service_date,
           String(b.job_type || 'Fabrication').trim(),
@@ -2447,11 +2817,12 @@ app.put(
           b.customer_acknowledgment ? 1 : 0,
           String(b.customer_signatory_name ?? '').trim(),
           String(b.acknowledgment_date ?? '').trim(),
-          String(b.technician_signature_url ?? '').trim(),
-          String(b.customer_signature_url ?? '').trim(),
+          techSigUrl,
+          custSigUrl,
           String(b.remarks ?? '').trim(),
           now,
           id,
+          bizId,
         ]
       );
 
@@ -2464,26 +2835,19 @@ app.put(
         );
       }
 
-      if (Array.isArray(b.photos)) {
+      if (validatedPhotos !== null) {
         await dbRun('DELETE FROM service_report_photos WHERE service_report_id = ?', [id]);
-        for (const p of b.photos) {
-          if (p?.photo_url) {
-            await dbRun(
-              `INSERT INTO service_report_photos (service_report_id, photo_type, photo_url, caption, created_at)
-               VALUES (?, ?, ?, ?, ?)`,
-              [
-                id,
-                p.photo_type === 'after' ? 'after' : 'before',
-                String(p.photo_url).trim(),
-                String(p.caption || '').trim(),
-                now,
-              ]
-            );
-          }
+        for (const p of validatedPhotos) {
+          await dbRun(
+            `INSERT INTO service_report_photos (service_report_id, photo_type, photo_url, caption, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [id, p.photo_type, p.photo_url, p.caption, now]
+          );
         }
       }
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'service_report',
         entity_id: id,
         document_number: existing.report_number,
@@ -2496,7 +2860,7 @@ app.put(
       });
     });
 
-    res.json({ service_report: await getFullServiceReport(id) });
+    res.json({ service_report: await getFullServiceReport(bizId, id) });
   })
 );
 
@@ -2504,15 +2868,18 @@ app.delete(
   '/api/service-reports/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM service_reports WHERE id = ? AND is_archived = 0', [
-      id,
-    ]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM service_reports WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Service report not found.' });
-    await dbRun('UPDATE service_reports SET is_archived = 1, updated_at = ? WHERE id = ?', [
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE service_reports SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
+    );
     await logActivity({
+      business_id: bizId,
       entity_type: 'service_report',
       entity_id: id,
       document_number: existing.report_number,
@@ -2529,9 +2896,9 @@ app.delete(
 app.get(
   '/api/service-reports/:id/pdf',
   asyncHandler(async (req, res) => {
-    const full = await getFullServiceReport(Number(req.params.id));
+    const full = await getFullServiceReport(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Service report not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateServiceReportPdf(full, full.materials, full.photos, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${full.report_number}.pdf"`);
@@ -2543,10 +2910,10 @@ app.get(
 // BILLING STATEMENTS MODULE
 // ============================================================================
 
-async function getFullBillingStatement(id) {
+async function getFullBillingStatement(businessId, id) {
   const statement = await dbGet(
-    'SELECT * FROM billing_statements WHERE id = ? AND is_archived = 0',
-    [id]
+    'SELECT * FROM billing_statements WHERE id = ? AND business_id = ? AND is_archived = 0',
+    [id, businessId]
   );
   if (!statement) return null;
   const lines = await dbAll(
@@ -2560,13 +2927,16 @@ app.get(
   '/api/billing-statements/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('billing_statement', dateStr) });
+    res.json({
+      next_number: await previewNextDocNumber(req.businessId, 'billing_statement', dateStr),
+    });
   })
 );
 
 app.get(
   '/api/billing-statements/preview',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const customerId = Number(req.query.customer_id);
     const periodFrom = String(req.query.period_from || '');
     const periodTo = String(req.query.period_to || '');
@@ -2582,10 +2952,13 @@ app.get(
         .json({ error: 'Billing period start date must be on or before end date.' });
     }
 
-    const customer = await dbGet('SELECT * FROM customers WHERE id = ?', [customerId]);
+    const customer = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      customerId,
+      bizId,
+    ]);
     if (!customer) return res.status(404).json({ error: 'Customer not found.' });
 
-    const ledger = await computeCustomerStatementLedger(customerId, periodFrom, periodTo);
+    const ledger = await computeCustomerStatementLedger(bizId, customerId, periodFrom, periodTo);
     res.json({ customer, ledger });
   })
 );
@@ -2597,8 +2970,8 @@ app.get(
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [req.businessId];
     if (dateFrom) {
       where += ' AND statement_date >= ?';
       params.push(dateFrom);
@@ -2624,7 +2997,7 @@ app.get(
 app.get(
   '/api/billing-statements/:id',
   asyncHandler(async (req, res) => {
-    const full = await getFullBillingStatement(Number(req.params.id));
+    const full = await getFullBillingStatement(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Billing statement not found.' });
     res.json({ billing_statement: full });
   })
@@ -2633,9 +3006,10 @@ app.get(
 app.post(
   '/api/billing-statements',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'billing_statement');
     if (idemHit) {
-      const existing = await getFullBillingStatement(idemHit);
+      const existing = await getFullBillingStatement(bizId, idemHit);
       if (existing) return res.json({ billing_statement: existing });
     }
 
@@ -2653,24 +3027,33 @@ app.post(
         .json({ error: 'Billing period start date must be on or before end date.' });
     }
 
-    const customer = await dbGet('SELECT * FROM customers WHERE id = ?', [customerId]);
+    const customer = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      customerId,
+      bizId,
+    ]);
     if (!customer) return res.status(404).json({ error: 'Customer not found.' });
 
     const createdId = await runInTransaction(async () => {
-      const ledger = await computeCustomerStatementLedger(customerId, b.period_from, b.period_to);
-      const stNumber = await allocateNextDocNumber('billing_statement', b.statement_date);
-      const settings = await getSettings();
+      const ledger = await computeCustomerStatementLedger(
+        bizId,
+        customerId,
+        b.period_from,
+        b.period_to
+      );
+      const stNumber = await allocateNextDocNumber(bizId, 'billing_statement', b.statement_date);
+      const settings = await getSettings(bizId);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO billing_statements (
-          statement_number, statement_date, period_from, period_to,
+          business_id, statement_number, statement_date, period_from, period_to,
           customer_id, customer_name, company_name, customer_address, contact_number, customer_email,
           previous_balance, total_charges, total_payments, outstanding_balance,
           payment_terms, remarks, prepared_by, authorized_signatory,
           is_archived, created_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
         [
+          bizId,
           stNumber,
           b.statement_date,
           b.period_from,
@@ -2721,6 +3104,7 @@ app.post(
 
       await saveIdempotencyKey(req, 'billing_statement', stId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'billing_statement',
         entity_id: stId,
         document_number: stNumber,
@@ -2735,7 +3119,7 @@ app.post(
       return stId;
     });
 
-    res.status(201).json({ billing_statement: await getFullBillingStatement(createdId) });
+    res.status(201).json({ billing_statement: await getFullBillingStatement(bizId, createdId) });
   })
 );
 
@@ -2743,9 +3127,10 @@ app.put(
   '/api/billing-statements/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM billing_statements WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM billing_statements WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Billing statement not found.' });
 
@@ -2759,11 +3144,14 @@ app.put(
         .json({ error: 'Billing period start date must be on or before end date.' });
     }
 
-    const customer = await dbGet('SELECT * FROM customers WHERE id = ?', [customerId]);
+    const customer = await dbGet('SELECT * FROM customers WHERE id = ? AND business_id = ?', [
+      customerId,
+      bizId,
+    ]);
     if (!customer) return res.status(404).json({ error: 'Customer not found.' });
 
     await runInTransaction(async () => {
-      const ledger = await computeCustomerStatementLedger(customerId, periodFrom, periodTo);
+      const ledger = await computeCustomerStatementLedger(bizId, customerId, periodFrom, periodTo);
       await dbRun(
         `UPDATE billing_statements
          SET statement_date = ?, period_from = ?, period_to = ?,
@@ -2771,7 +3159,7 @@ app.put(
              contact_number = ?, customer_email = ?,
              previous_balance = ?, total_charges = ?, total_payments = ?, outstanding_balance = ?,
              payment_terms = ?, remarks = ?, prepared_by = ?, authorized_signatory = ?, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND business_id = ?`,
         [
           b.statement_date || existing.statement_date,
           periodFrom,
@@ -2792,6 +3180,7 @@ app.put(
           String(b.authorized_signatory ?? '').trim(),
           nowISO(),
           id,
+          bizId,
         ]
       );
 
@@ -2820,6 +3209,7 @@ app.put(
       }
 
       await logActivity({
+        business_id: bizId,
         entity_type: 'billing_statement',
         entity_id: id,
         document_number: existing.statement_number,
@@ -2832,7 +3222,7 @@ app.put(
       });
     });
 
-    res.json({ billing_statement: await getFullBillingStatement(id) });
+    res.json({ billing_statement: await getFullBillingStatement(bizId, id) });
   })
 );
 
@@ -2840,16 +3230,18 @@ app.delete(
   '/api/billing-statements/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM billing_statements WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM billing_statements WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Billing statement not found.' });
-    await dbRun('UPDATE billing_statements SET is_archived = 1, updated_at = ? WHERE id = ?', [
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE billing_statements SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
+    );
     await logActivity({
+      business_id: bizId,
       entity_type: 'billing_statement',
       entity_id: id,
       document_number: existing.statement_number,
@@ -2866,9 +3258,9 @@ app.delete(
 app.get(
   '/api/billing-statements/:id/pdf',
   asyncHandler(async (req, res) => {
-    const full = await getFullBillingStatement(Number(req.params.id));
+    const full = await getFullBillingStatement(req.businessId, Number(req.params.id));
     if (!full) return res.status(404).json({ error: 'Billing statement not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateBillingStatementPdf(full, full.lines, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${full.statement_number}.pdf"`);
@@ -2883,7 +3275,8 @@ app.get(
 app.get(
   '/api/reports',
   asyncHandler(async (req, res) => {
-    await refreshTimeSensitiveStatuses();
+    const bizId = req.businessId;
+    await refreshTimeSensitiveStatuses(bizId);
     const dateFrom = String(req.query.date_from || '2000-01-01');
     const dateTo = String(req.query.date_to || '2099-12-31');
 
@@ -2894,8 +3287,8 @@ app.get(
         COALESCE(SUM(discount_amount), 0) as total_discounts,
         COALESCE(SUM(tax_amount), 0) as total_tax
        FROM invoices
-       WHERE is_archived = 0 AND invoice_date >= ? AND invoice_date <= ?`,
-      [dateFrom, dateTo]
+       WHERE business_id = ? AND is_archived = 0 AND invoice_date >= ? AND invoice_date <= ?`,
+      [bizId, dateFrom, dateTo]
     );
 
     const collectionsSummary = await dbGet(
@@ -2903,42 +3296,43 @@ app.get(
         COUNT(*) as payment_count,
         COALESCE(SUM(p.amount), 0) as total_collected
        FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
-       WHERE i.is_archived = 0 AND p.payment_date >= ? AND p.payment_date <= ?`,
-      [dateFrom, dateTo]
+       JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
+       WHERE p.business_id = ? AND i.is_archived = 0 AND p.payment_date >= ? AND p.payment_date <= ?`,
+      [bizId, dateFrom, dateTo]
     );
 
     const collectionsByMethod = await dbAll(
       `SELECT p.payment_method, COUNT(*) as count, COALESCE(SUM(p.amount), 0) as total
        FROM payments p
-       JOIN invoices i ON i.id = p.invoice_id
-       WHERE i.is_archived = 0 AND p.payment_date >= ? AND p.payment_date <= ?
+       JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id
+       WHERE p.business_id = ? AND i.is_archived = 0 AND p.payment_date >= ? AND p.payment_date <= ?
        GROUP BY p.payment_method
        ORDER BY total DESC`,
-      [dateFrom, dateTo]
+      [bizId, dateFrom, dateTo]
     );
 
     const quotationBreakdown = await dbAll(
       `SELECT status, COUNT(*) as count, COALESCE(SUM(grand_total), 0) as total_value
        FROM quotations
-       WHERE is_archived = 0 AND date_issued >= ? AND date_issued <= ?
+       WHERE business_id = ? AND is_archived = 0 AND date_issued >= ? AND date_issued <= ?
        GROUP BY status`,
-      [dateFrom, dateTo]
+      [bizId, dateFrom, dateTo]
     );
 
     const serviceBreakdown = await dbAll(
       `SELECT status, job_type, COUNT(*) as count, COALESCE(SUM(materials_total_cost), 0) as materials_cost
        FROM service_reports
-       WHERE is_archived = 0 AND service_date >= ? AND service_date <= ?
+       WHERE business_id = ? AND is_archived = 0 AND service_date >= ? AND service_date <= ?
        GROUP BY status, job_type`,
-      [dateFrom, dateTo]
+      [bizId, dateFrom, dateTo]
     );
 
     const openInvoices = await dbAll(
       `SELECT id, invoice_number, customer_name, company_name, invoice_date, due_date, total_amount_due, amount_paid, remaining_balance, status
        FROM invoices
-       WHERE is_archived = 0 AND remaining_balance > 0.009
-       ORDER BY due_date ASC, invoice_date ASC`
+       WHERE business_id = ? AND is_archived = 0 AND remaining_balance > 0.009
+       ORDER BY due_date ASC, invoice_date ASC`,
+      [bizId]
     );
 
     const todayMs = new Date(`${todayYMD()}T00:00:00Z`).getTime();
@@ -2974,11 +3368,11 @@ app.get(
         COALESCE(SUM(amount_paid), 0) as total_paid,
         COALESCE(SUM(remaining_balance), 0) as balance_due
        FROM invoices
-       WHERE is_archived = 0 AND invoice_date >= ? AND invoice_date <= ?
+       WHERE business_id = ? AND is_archived = 0 AND invoice_date >= ? AND invoice_date <= ?
        GROUP BY LOWER(TRIM(customer_name)), LOWER(TRIM(company_name))
        ORDER BY total_billed DESC
        LIMIT 10`,
-      [dateFrom, dateTo]
+      [bizId, dateFrom, dateTo]
     );
 
     res.json({
@@ -3009,8 +3403,8 @@ app.get(
 
 app.get(
   '/api/employees/next-code',
-  asyncHandler(async (_req, res) => {
-    res.json({ next_code: await previewNextDocNumber('employee') });
+  asyncHandler(async (req, res) => {
+    res.json({ next_code: await previewNextDocNumber(req.businessId, 'employee') });
   })
 );
 
@@ -3020,8 +3414,8 @@ app.get(
     const search = String(req.query.search || '').trim();
     const status = String(req.query.status || 'active');
 
-    let where = 'WHERE 1=1';
-    const params = [];
+    let where = 'WHERE e.business_id = ?';
+    const params = [req.businessId];
     if (status === 'active') where += ' AND e.is_active = 1';
     else if (status === 'inactive') where += ' AND e.is_active = 0';
 
@@ -3034,9 +3428,9 @@ app.get(
 
     const employees = await dbAll(
       `SELECT e.*,
-        (SELECT COUNT(*) FROM payslips p WHERE p.employee_id = e.id AND p.is_archived = 0) as payslip_count,
-        (SELECT COUNT(*) FROM certificates_of_employment c WHERE c.employee_id = e.id AND c.is_archived = 0) as coe_count,
-        (SELECT COUNT(*) FROM employee_id_cards ic WHERE ic.employee_id = e.id AND ic.is_archived = 0) as id_card_count
+        (SELECT COUNT(*) FROM payslips p WHERE p.employee_id = e.id AND p.business_id = e.business_id AND p.is_archived = 0) as payslip_count,
+        (SELECT COUNT(*) FROM certificates_of_employment c WHERE c.employee_id = e.id AND c.business_id = e.business_id AND c.is_archived = 0) as coe_count,
+        (SELECT COUNT(*) FROM employee_id_cards ic WHERE ic.employee_id = e.id AND ic.business_id = e.business_id AND ic.is_archived = 0) as id_card_count
        FROM employees e
        ${where}
        ORDER BY e.full_name ASC, e.id DESC`,
@@ -3051,25 +3445,29 @@ app.get(
   '/api/employees/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const employee = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const employee = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!employee) return res.status(404).json({ error: 'Employee record not found.' });
 
     const payslips = await dbAll(
       `SELECT id, payslip_number, pay_period_start, pay_period_end, payment_date, total_earnings, total_deductions, net_pay, status, created_at
-       FROM payslips WHERE employee_id = ? AND is_archived = 0 ORDER BY payment_date DESC, id DESC`,
-      [id]
+       FROM payslips WHERE employee_id = ? AND business_id = ? AND is_archived = 0 ORDER BY payment_date DESC, id DESC`,
+      [id, bizId]
     );
 
     const certificates = await dbAll(
       `SELECT id, certificate_number, date_issued, position_title, employment_status, include_salary, created_at
-       FROM certificates_of_employment WHERE employee_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
-      [id]
+       FROM certificates_of_employment WHERE employee_id = ? AND business_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
+      [id, bizId]
     );
 
     const id_cards = await dbAll(
       `SELECT id, card_number, employee_code, date_issued, expiration_date, status, created_at
-       FROM employee_id_cards WHERE employee_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
-      [id]
+       FROM employee_id_cards WHERE employee_id = ? AND business_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
+      [id, bizId]
     );
 
     res.json({
@@ -3086,9 +3484,13 @@ app.get(
 app.post(
   '/api/employees',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'employee');
     if (idemHit) {
-      const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [idemHit]);
+      const existing = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+        idemHit,
+        bizId,
+      ]);
       if (existing) return res.json({ employee: existing });
     }
 
@@ -3110,11 +3512,17 @@ app.post(
         .json({ error: 'Employment end date cannot be earlier than start date.' });
     }
 
+    const validatedPhotoUrl = await assertAssetUrlBelongsToBusiness(
+      b.photo_url,
+      bizId,
+      'Employee photo'
+    );
+
     const requestedCode = String(b.employee_code || '').trim();
     if (requestedCode) {
       const dup = await dbGet(
-        'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
-        [requestedCode]
+        'SELECT id, employee_code, full_name FROM employees WHERE business_id = ? AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+        [bizId, requestedCode]
       );
       if (dup) {
         return res.status(409).json({
@@ -3128,10 +3536,10 @@ app.post(
       : 'daily';
 
     const created = await runInTransaction(async () => {
-      const code = requestedCode || (await allocateNextDocNumber('employee'));
+      const code = requestedCode || (await allocateNextDocNumber(bizId, 'employee'));
       const dupCheck = await dbGet(
-        'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
-        [code]
+        'SELECT id, employee_code, full_name FROM employees WHERE business_id = ? AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+        [bizId, code]
       );
       if (dupCheck) {
         const err = new Error(
@@ -3144,12 +3552,13 @@ app.post(
       const now = nowISO();
       const info = await dbRun(
         `INSERT INTO employees (
-          employee_code, full_name, position_title, department, employment_type, employment_status,
+          business_id, employee_code, full_name, position_title, department, employment_type, employment_status,
           start_date, end_date, contact_number, email, address,
           emergency_contact_name, emergency_contact_number,
           pay_basis, default_rate, photo_url, notes, is_active, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
         [
+          bizId,
           code,
           fullName,
           positionTitle,
@@ -3165,7 +3574,7 @@ app.post(
           String(b.emergency_contact_number || '').trim(),
           validBasis,
           Math.max(0, round2(b.default_rate)),
-          String(b.photo_url || '').trim(),
+          validatedPhotoUrl,
           String(b.notes || '').trim(),
           now,
           now,
@@ -3174,6 +3583,7 @@ app.post(
       const id = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'employee', id);
       await logActivity({
+        business_id: bizId,
         entity_type: 'employee',
         entity_id: id,
         document_number: code,
@@ -3182,7 +3592,7 @@ app.post(
         summary: `Added employee ${fullName} (${code}) — ${positionTitle}`,
         actor_name: req.user.full_name,
       });
-      return dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+      return dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [id, bizId]);
     });
 
     res.status(201).json({ employee: created });
@@ -3193,7 +3603,11 @@ app.put(
   '/api/employees/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
 
     const b = req.body || {};
@@ -3219,9 +3633,15 @@ app.put(
         .json({ error: 'Employment end date cannot be earlier than start date.' });
     }
 
+    const validatedPhotoUrl = await assertAssetUrlBelongsToBusiness(
+      b.photo_url ?? existing.photo_url,
+      bizId,
+      'Employee photo'
+    );
+
     const dup = await dbGet(
-      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?)) AND id != ?',
-      [employeeCode, id]
+      'SELECT id, employee_code, full_name FROM employees WHERE business_id = ? AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?)) AND id != ?',
+      [bizId, employeeCode, id]
     );
     if (dup) {
       return res.status(409).json({
@@ -3233,7 +3653,6 @@ app.put(
       ? b.pay_basis
       : existing.pay_basis || 'daily';
 
-    // Historical payslips, COEs, and ID cards store snapshotted fields and remain untouched
     await dbRun(
       `UPDATE employees
        SET employee_code = ?,
@@ -3255,7 +3674,7 @@ app.put(
            notes = ?,
            is_active = ?,
            updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND business_id = ?`,
       [
         employeeCode,
         fullName,
@@ -3272,15 +3691,19 @@ app.put(
         String(b.emergency_contact_number ?? existing.emergency_contact_number).trim(),
         validBasis,
         b.default_rate !== undefined ? Math.max(0, round2(b.default_rate)) : existing.default_rate,
-        String(b.photo_url ?? existing.photo_url).trim(),
+        validatedPhotoUrl,
         String(b.notes ?? existing.notes).trim(),
         b.is_active !== undefined ? (b.is_active ? 1 : 0) : existing.is_active,
         nowISO(),
         id,
+        bizId,
       ]
     );
 
-    const updated = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    const updated = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     res.json({ employee: updated });
   })
 );
@@ -3289,20 +3712,29 @@ app.patch(
   '/api/employees/:id/status',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
 
     const isActive = req.body?.is_active ? 1 : 0;
     const nextEmploymentStatus =
       req.body?.employment_status ||
-      (isActive ? (existing.employment_status === 'Inactive' ? 'Active' : existing.employment_status) : 'Inactive');
+      (isActive
+        ? existing.employment_status === 'Inactive'
+          ? 'Active'
+          : existing.employment_status
+        : 'Inactive');
 
     await dbRun(
-      'UPDATE employees SET is_active = ?, employment_status = ?, updated_at = ? WHERE id = ?',
-      [isActive, String(nextEmploymentStatus).trim(), nowISO(), id]
+      'UPDATE employees SET is_active = ?, employment_status = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [isActive, String(nextEmploymentStatus).trim(), nowISO(), id, bizId]
     );
 
     await logActivity({
+      business_id: bizId,
       entity_type: 'employee',
       entity_id: id,
       document_number: existing.employee_code,
@@ -3312,7 +3744,12 @@ app.patch(
       actor_name: req.user.full_name,
     });
 
-    res.json({ employee: await dbGet('SELECT * FROM employees WHERE id = ?', [id]) });
+    res.json({
+      employee: await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+        id,
+        bizId,
+      ]),
+    });
   })
 );
 
@@ -3320,15 +3757,19 @@ app.delete(
   '/api/employees/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+      id,
+      bizId,
+    ]);
     if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
 
     const refs = await dbGet(
       `SELECT
-        (SELECT COUNT(*) FROM payslips WHERE employee_id = ? AND is_archived = 0) as payslips,
-        (SELECT COUNT(*) FROM certificates_of_employment WHERE employee_id = ? AND is_archived = 0) as coes,
-        (SELECT COUNT(*) FROM employee_id_cards WHERE employee_id = ? AND is_archived = 0) as ids`,
-      [id, id, id]
+        (SELECT COUNT(*) FROM payslips WHERE employee_id = ? AND business_id = ? AND is_archived = 0) as payslips,
+        (SELECT COUNT(*) FROM certificates_of_employment WHERE employee_id = ? AND business_id = ? AND is_archived = 0) as coes,
+        (SELECT COUNT(*) FROM employee_id_cards WHERE employee_id = ? AND business_id = ? AND is_archived = 0) as ids`,
+      [id, bizId, id, bizId, id, bizId]
     );
     const totalRefs =
       Number(refs?.payslips || 0) + Number(refs?.coes || 0) + Number(refs?.ids || 0);
@@ -3339,7 +3780,7 @@ app.delete(
       });
     }
 
-    await dbRun('DELETE FROM employees WHERE id = ?', [id]);
+    await dbRun('DELETE FROM employees WHERE id = ? AND business_id = ?', [id, bizId]);
     res.json({ ok: true });
   })
 );
@@ -3424,7 +3865,7 @@ app.get(
   '/api/payslips/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('payslip', dateStr) });
+    res.json({ next_number: await previewNextDocNumber(req.businessId, 'payslip', dateStr) });
   })
 );
 
@@ -3437,8 +3878,8 @@ app.get(
     const dateFrom = String(req.query.date_from || '');
     const dateTo = String(req.query.date_to || '');
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [req.businessId];
     if (status && status !== 'all') {
       where += ' AND status = ?';
       params.push(status);
@@ -3473,9 +3914,10 @@ app.get(
 app.get(
   '/api/payslips/:id',
   asyncHandler(async (req, res) => {
-    const payslip = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
-      Number(req.params.id),
-    ]);
+    const payslip = await dbGet(
+      'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
+    );
     if (!payslip) return res.status(404).json({ error: 'Payslip not found.' });
     res.json({ payslip });
   })
@@ -3484,19 +3926,33 @@ app.get(
 app.post(
   '/api/payslips',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'payslip');
     if (idemHit) {
-      const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
-        idemHit,
-      ]);
+      const existing = await dbGet(
+        'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+        [idemHit, bizId]
+      );
       if (existing) return res.json({ payslip: existing });
     }
 
     const b = req.body || {};
     const employeeId = b.employee_id ? Number(b.employee_id) : null;
     const empRow = employeeId
-      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      ? await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+          employeeId,
+          bizId,
+        ])
       : null;
+    if (employeeId && !empRow) {
+      return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+    }
+
+    const validatedEmpSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.employee_signature_url,
+      bizId,
+      'Employee signature'
+    );
 
     const employeeName = String(b.employee_name || empRow?.full_name || '').trim();
     const employeeCode = String(b.employee_code || empRow?.employee_code || '').trim();
@@ -3524,10 +3980,20 @@ app.post(
     }
 
     const calc = computePayslipBreakdown(b);
-    if (calc.pay_basis === 'daily' && calc.base_rate > 0 && calc.days_worked <= 0 && calc.total_earnings <= 0) {
+    if (
+      calc.pay_basis === 'daily' &&
+      calc.base_rate > 0 &&
+      calc.days_worked <= 0 &&
+      calc.total_earnings <= 0
+    ) {
       return res.status(400).json({ error: 'Please enter days worked for a Daily Rate payslip.' });
     }
-    if (calc.pay_basis === 'hourly' && calc.base_rate > 0 && calc.hours_worked <= 0 && calc.total_earnings <= 0) {
+    if (
+      calc.pay_basis === 'hourly' &&
+      calc.base_rate > 0 &&
+      calc.hours_worked <= 0 &&
+      calc.total_earnings <= 0
+    ) {
       return res.status(400).json({ error: 'Please enter hours worked for an Hourly Rate payslip.' });
     }
     if (calc.total_earnings <= 0) {
@@ -3541,25 +4007,26 @@ app.post(
       });
     }
 
-    // Prevent accidental duplicate payslips for the same employee and pay period
     const dup = employeeId
       ? await dbGet(
           `SELECT id, payslip_number FROM payslips
-           WHERE is_archived = 0
+           WHERE business_id = ?
+             AND is_archived = 0
              AND (employee_id = ? OR LOWER(TRIM(employee_code)) = LOWER(TRIM(?)))
              AND pay_period_start = ?
              AND pay_period_end = ?
            LIMIT 1`,
-          [employeeId, employeeCode, periodStart, periodEnd]
+          [bizId, employeeId, employeeCode, periodStart, periodEnd]
         )
       : await dbGet(
           `SELECT id, payslip_number FROM payslips
-           WHERE is_archived = 0
+           WHERE business_id = ?
+             AND is_archived = 0
              AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
              AND pay_period_start = ?
              AND pay_period_end = ?
            LIMIT 1`,
-          [employeeCode, periodStart, periodEnd]
+          [bizId, employeeCode, periodStart, periodEnd]
         );
 
     if (dup) {
@@ -3571,13 +4038,13 @@ app.post(
     const validStatus = ['Draft', 'Issued', 'Paid'].includes(b.status) ? b.status : 'Issued';
 
     const createdId = await runInTransaction(async () => {
-      const pslNumber = await allocateNextDocNumber('payslip', paymentDate);
-      const settings = await getSettings();
+      const pslNumber = await allocateNextDocNumber(bizId, 'payslip', paymentDate);
+      const settings = await getSettings(bizId);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO payslips (
-          payslip_number, employee_id, employee_code, employee_name, position_title, department,
+          business_id, payslip_number, employee_id, employee_code, employee_name, position_title, department,
           pay_period_start, pay_period_end, payment_date,
           pay_basis, base_rate, days_worked, hours_worked, regular_pay,
           overtime_hours, overtime_rate, overtime_pay,
@@ -3587,7 +4054,7 @@ app.post(
           payment_method, remarks, prepared_by, approved_by, employee_signature_url,
           status, is_archived, created_at, updated_at
         ) VALUES (
-          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?,
           ?, ?, ?, ?, ?,
           ?, ?, ?,
@@ -3598,6 +4065,7 @@ app.post(
           ?, 0, ?, ?
         )`,
         [
+          bizId,
           pslNumber,
           empRow ? empRow.id : null,
           employeeCode,
@@ -3633,7 +4101,7 @@ app.post(
           String(b.remarks || '').trim(),
           String(b.prepared_by ?? req.user.full_name ?? '').trim(),
           String(b.approved_by ?? settings.authorized_representative ?? '').trim(),
-          String(b.employee_signature_url || '').trim(),
+          validatedEmpSigUrl,
           validStatus,
           now,
           now,
@@ -3643,6 +4111,7 @@ app.post(
       const newId = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'payslip', newId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'payslip',
         entity_id: newId,
         document_number: pslNumber,
@@ -3656,7 +4125,10 @@ app.post(
     });
 
     res.status(201).json({
-      payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [createdId]),
+      payslip: await dbGet('SELECT * FROM payslips WHERE id = ? AND business_id = ?', [
+        createdId,
+        bizId,
+      ]),
     });
   })
 );
@@ -3665,7 +4137,11 @@ app.put(
   '/api/payslips/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
 
     const b = req.body || {};
@@ -3675,6 +4151,23 @@ app.put(
           ? Number(b.employee_id)
           : null
         : existing.employee_id;
+
+    if (employeeId) {
+      const empCheck = await dbGet('SELECT id FROM employees WHERE id = ? AND business_id = ?', [
+        employeeId,
+        bizId,
+      ]);
+      if (!empCheck) {
+        return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+      }
+    }
+
+    const validatedEmpSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.employee_signature_url ?? existing.employee_signature_url,
+      bizId,
+      'Employee signature'
+    );
+
     const employeeName = String(b.employee_name ?? existing.employee_name).trim();
     const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
     const positionTitle = String(b.position_title ?? existing.position_title).trim();
@@ -3710,23 +4203,25 @@ app.put(
     const dup = employeeId
       ? await dbGet(
           `SELECT id, payslip_number FROM payslips
-           WHERE is_archived = 0
+           WHERE business_id = ?
+             AND is_archived = 0
              AND id != ?
              AND (employee_id = ? OR LOWER(TRIM(employee_code)) = LOWER(TRIM(?)))
              AND pay_period_start = ?
              AND pay_period_end = ?
            LIMIT 1`,
-          [id, employeeId, employeeCode, periodStart, periodEnd]
+          [bizId, id, employeeId, employeeCode, periodStart, periodEnd]
         )
       : await dbGet(
           `SELECT id, payslip_number FROM payslips
-           WHERE is_archived = 0
+           WHERE business_id = ?
+             AND is_archived = 0
              AND id != ?
              AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
              AND pay_period_start = ?
              AND pay_period_end = ?
            LIMIT 1`,
-          [id, employeeCode, periodStart, periodEnd]
+          [bizId, id, employeeCode, periodStart, periodEnd]
         );
 
     if (dup) {
@@ -3748,7 +4243,7 @@ app.put(
            total_earnings = ?, total_deductions = ?, net_pay = ?,
            payment_method = ?, remarks = ?, prepared_by = ?, approved_by = ?, employee_signature_url = ?,
            status = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND business_id = ?`,
       [
         employeeId,
         employeeCode,
@@ -3784,14 +4279,17 @@ app.put(
         String(b.remarks ?? existing.remarks).trim(),
         String(b.prepared_by ?? existing.prepared_by).trim(),
         String(b.approved_by ?? existing.approved_by).trim(),
-        String(b.employee_signature_url ?? existing.employee_signature_url).trim(),
+        validatedEmpSigUrl,
         validStatus,
         nowISO(),
         id,
+        bizId,
       ]
     );
 
-    res.json({ payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [id]) });
+    res.json({
+      payslip: await dbGet('SELECT * FROM payslips WHERE id = ? AND business_id = ?', [id, bizId]),
+    });
   })
 );
 
@@ -3799,18 +4297,23 @@ app.patch(
   '/api/payslips/:id/status',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
     const status = String(req.body?.status || '');
     if (!['Draft', 'Issued', 'Paid'].includes(status)) {
       return res.status(400).json({ error: 'Invalid payslip status.' });
     }
-    await dbRun('UPDATE payslips SET status = ?, updated_at = ? WHERE id = ?', [
-      status,
-      nowISO(),
-      id,
-    ]);
-    res.json({ payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [id]) });
+    await dbRun(
+      'UPDATE payslips SET status = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+      [status, nowISO(), id, bizId]
+    );
+    res.json({
+      payslip: await dbGet('SELECT * FROM payslips WHERE id = ? AND business_id = ?', [id, bizId]),
+    });
   })
 );
 
@@ -3818,9 +4321,16 @@ app.delete(
   '/api/payslips/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    const bizId = req.businessId;
+    const existing = await dbGet(
+      'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
+    );
     if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
-    await dbRun('UPDATE payslips SET is_archived = 1, updated_at = ? WHERE id = ?', [nowISO(), id]);
+    await dbRun(
+      'UPDATE payslips SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
+    );
     res.json({ ok: true });
   })
 );
@@ -3828,11 +4338,12 @@ app.delete(
 app.get(
   '/api/payslips/:id/pdf',
   asyncHandler(async (req, res) => {
-    const payslip = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
-      Number(req.params.id),
-    ]);
+    const payslip = await dbGet(
+      'SELECT * FROM payslips WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
+    );
     if (!payslip) return res.status(404).json({ error: 'Payslip not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generatePayslipPdf(payslip, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${payslip.payslip_number}.pdf"`);
@@ -3848,7 +4359,7 @@ app.get(
   '/api/certificates-of-employment/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('coe', dateStr) });
+    res.json({ next_number: await previewNextDocNumber(req.businessId, 'coe', dateStr) });
   })
 );
 
@@ -3858,8 +4369,8 @@ app.get(
     const search = String(req.query.search || '').trim();
     const employeeId = Number(req.query.employee_id || 0);
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [req.businessId];
     if (employeeId > 0) {
       where += ' AND employee_id = ?';
       params.push(employeeId);
@@ -3883,8 +4394,8 @@ app.get(
   '/api/certificates-of-employment/:id',
   asyncHandler(async (req, res) => {
     const certificate = await dbGet(
-      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
-      [Number(req.params.id)]
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
     );
     if (!certificate) return res.status(404).json({ error: 'Certificate of Employment not found.' });
     res.json({ certificate });
@@ -3894,11 +4405,12 @@ app.get(
 app.post(
   '/api/certificates-of-employment',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'coe');
     if (idemHit) {
       const existing = await dbGet(
-        'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
-        [idemHit]
+        'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ? AND is_archived = 0',
+        [idemHit, bizId]
       );
       if (existing) return res.json({ certificate: existing });
     }
@@ -3906,8 +4418,21 @@ app.post(
     const b = req.body || {};
     const employeeId = b.employee_id ? Number(b.employee_id) : null;
     const empRow = employeeId
-      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      ? await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+          employeeId,
+          bizId,
+        ])
       : null;
+    if (employeeId && !empRow) {
+      return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+    }
+
+    const settings = await getSettings(bizId);
+    const validatedSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.signature_url ?? settings.signature_url,
+      bizId,
+      'Signatory signature'
+    );
 
     const employeeName = String(b.employee_name || empRow?.full_name || '').trim();
     const employeeCode = String(b.employee_code ?? empRow?.employee_code ?? '').trim();
@@ -3952,19 +4477,19 @@ app.post(
     }
 
     const createdId = await runInTransaction(async () => {
-      const certNum = await allocateNextDocNumber('coe', dateIssued);
-      const settings = await getSettings();
+      const certNum = await allocateNextDocNumber(bizId, 'coe', dateIssued);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO certificates_of_employment (
-          certificate_number, employee_id, employee_code, employee_name, position_title, department,
+          business_id, certificate_number, employee_id, employee_code, employee_name, position_title, department,
           employment_type, employment_status, start_date, end_date, date_issued, purpose,
           include_salary, salary_amount, salary_period, custom_body,
           signatory_name, signatory_title, signature_url, remarks,
           is_archived, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         [
+          bizId,
           certNum,
           empRow ? empRow.id : null,
           employeeCode,
@@ -3982,8 +4507,10 @@ app.post(
           salaryPeriod,
           String(b.custom_body || '').trim(),
           String(b.signatory_name ?? settings.authorized_representative ?? '').trim(),
-          String(b.signatory_title ?? settings.authorized_title ?? 'Authorized Representative').trim(),
-          String(b.signature_url ?? settings.signature_url ?? '').trim(),
+          String(
+            b.signatory_title ?? settings.authorized_title ?? 'Authorized Representative'
+          ).trim(),
+          validatedSigUrl,
           String(b.remarks || '').trim(),
           now,
           now,
@@ -3993,6 +4520,7 @@ app.post(
       const newId = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'coe', newId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'coe',
         entity_id: newId,
         document_number: certNum,
@@ -4005,9 +4533,10 @@ app.post(
     });
 
     res.status(201).json({
-      certificate: await dbGet('SELECT * FROM certificates_of_employment WHERE id = ?', [
-        createdId,
-      ]),
+      certificate: await dbGet(
+        'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ?',
+        [createdId, bizId]
+      ),
     });
   })
 );
@@ -4016,9 +4545,10 @@ app.put(
   '/api/certificates-of-employment/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Certificate of Employment not found.' });
 
@@ -4029,6 +4559,23 @@ app.put(
           ? Number(b.employee_id)
           : null
         : existing.employee_id;
+
+    if (employeeId) {
+      const empCheck = await dbGet('SELECT id FROM employees WHERE id = ? AND business_id = ?', [
+        employeeId,
+        bizId,
+      ]);
+      if (!empCheck) {
+        return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+      }
+    }
+
+    const validatedSigUrl = await assertAssetUrlBelongsToBusiness(
+      b.signature_url ?? existing.signature_url,
+      bizId,
+      'Signatory signature'
+    );
+
     const employeeName = String(b.employee_name ?? existing.employee_name).trim();
     const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
     const positionTitle = String(b.position_title ?? existing.position_title).trim();
@@ -4065,7 +4612,7 @@ app.put(
            employment_type = ?, employment_status = ?, start_date = ?, end_date = ?, date_issued = ?, purpose = ?,
            include_salary = ?, salary_amount = ?, salary_period = ?, custom_body = ?,
            signatory_name = ?, signatory_title = ?, signature_url = ?, remarks = ?, updated_at = ?
-       WHERE id = ?`,
+       WHERE id = ? AND business_id = ?`,
       [
         employeeId,
         employeeCode,
@@ -4084,15 +4631,19 @@ app.put(
         String(b.custom_body ?? existing.custom_body).trim(),
         String(b.signatory_name ?? existing.signatory_name).trim(),
         String(b.signatory_title ?? existing.signatory_title).trim(),
-        String(b.signature_url ?? existing.signature_url).trim(),
+        validatedSigUrl,
         String(b.remarks ?? existing.remarks).trim(),
         nowISO(),
         id,
+        bizId,
       ]
     );
 
     res.json({
-      certificate: await dbGet('SELECT * FROM certificates_of_employment WHERE id = ?', [id]),
+      certificate: await dbGet(
+        'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ?',
+        [id, bizId]
+      ),
     });
   })
 );
@@ -4101,14 +4652,15 @@ app.delete(
   '/api/certificates-of-employment/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Certificate of Employment not found.' });
     await dbRun(
-      'UPDATE certificates_of_employment SET is_archived = 1, updated_at = ? WHERE id = ?',
-      [nowISO(), id]
+      'UPDATE certificates_of_employment SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
     );
     res.json({ ok: true });
   })
@@ -4118,11 +4670,11 @@ app.get(
   '/api/certificates-of-employment/:id/pdf',
   asyncHandler(async (req, res) => {
     const certificate = await dbGet(
-      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
-      [Number(req.params.id)]
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
     );
     if (!certificate) return res.status(404).json({ error: 'Certificate of Employment not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateCoePdf(certificate, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
@@ -4141,7 +4693,7 @@ app.get(
   '/api/employee-id-cards/next-number',
   asyncHandler(async (req, res) => {
     const dateStr = String(req.query.date || todayYMD());
-    res.json({ next_number: await previewNextDocNumber('id_card', dateStr) });
+    res.json({ next_number: await previewNextDocNumber(req.businessId, 'id_card', dateStr) });
   })
 );
 
@@ -4152,8 +4704,8 @@ app.get(
     const status = String(req.query.status || 'all');
     const employeeId = Number(req.query.employee_id || 0);
 
-    let where = 'WHERE is_archived = 0';
-    const params = [];
+    let where = 'WHERE business_id = ? AND is_archived = 0';
+    const params = [req.businessId];
     if (status && status !== 'all') {
       where += ' AND status = ?';
       params.push(status);
@@ -4181,8 +4733,8 @@ app.get(
   '/api/employee-id-cards/:id',
   asyncHandler(async (req, res) => {
     const id_card = await dbGet(
-      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-      [Number(req.params.id)]
+      'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
     );
     if (!id_card) return res.status(404).json({ error: 'Employee ID card not found.' });
     res.json({ id_card });
@@ -4192,11 +4744,12 @@ app.get(
 app.post(
   '/api/employee-id-cards',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
     const idemHit = await getIdempotencyHit(req, 'employee_id');
     if (idemHit) {
       const existing = await dbGet(
-        'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-        [idemHit]
+        'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+        [idemHit, bizId]
       );
       if (existing) return res.json({ id_card: existing });
     }
@@ -4204,8 +4757,14 @@ app.post(
     const b = req.body || {};
     const employeeId = b.employee_id ? Number(b.employee_id) : null;
     const empRow = employeeId
-      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      ? await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+          employeeId,
+          bizId,
+        ])
       : null;
+    if (employeeId && !empRow) {
+      return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+    }
 
     const employeeCode = String(b.employee_code || empRow?.employee_code || '').trim();
     const fullName = String(b.full_name || empRow?.full_name || '').trim();
@@ -4231,10 +4790,9 @@ app.post(
         .json({ error: 'Expiration date cannot be earlier than date issued.' });
     }
 
-    // Prevent using an Employee ID code belonging to a different employee in the directory
     const conflictingDirectoryEmp = await dbGet(
-      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
-      [employeeCode]
+      'SELECT id, employee_code, full_name FROM employees WHERE business_id = ? AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+      [bizId, employeeCode]
     );
     if (conflictingDirectoryEmp && (!empRow || conflictingDirectoryEmp.id !== empRow.id)) {
       return res.status(409).json({
@@ -4246,11 +4804,12 @@ app.post(
     const activeCardCollision = await dbGet(
       `SELECT id, card_number, full_name, employee_id
        FROM employee_id_cards
-       WHERE is_archived = 0
+       WHERE business_id = ?
+         AND is_archived = 0
          AND status = 'Active'
          AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
        LIMIT 1`,
-      [employeeCode]
+      [bizId, employeeCode]
     );
 
     if (activeCardCollision && !replaceExisting) {
@@ -4259,29 +4818,39 @@ app.post(
       });
     }
 
-    const photoUrl = String(b.photo_url ?? empRow?.photo_url ?? '').trim();
+    const settings = await getSettings(bizId);
+    const photoUrl = await assertAssetUrlBelongsToBusiness(
+      b.photo_url ?? empRow?.photo_url ?? '',
+      bizId,
+      'Employee photo'
+    );
+    const sigUrl = await assertAssetUrlBelongsToBusiness(
+      b.signature_url ?? settings.signature_url ?? '',
+      bizId,
+      'Authorized signature'
+    );
     const validStatus = ['Active', 'Expired', 'Revoked'].includes(b.status) ? b.status : 'Active';
 
     const createdId = await runInTransaction(async () => {
       if (activeCardCollision && replaceExisting) {
         await dbRun(
-          "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ?",
-          [nowISO(), activeCardCollision.id]
+          "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?",
+          [nowISO(), activeCardCollision.id, bizId]
         );
       }
 
-      const cardNum = await allocateNextDocNumber('id_card', dateIssued);
-      const settings = await getSettings();
+      const cardNum = await allocateNextDocNumber(bizId, 'id_card', dateIssued);
       const now = nowISO();
 
       const info = await dbRun(
         `INSERT INTO employee_id_cards (
-          card_number, employee_id, employee_code, full_name, position_title, department,
+          business_id, card_number, employee_id, employee_code, full_name, position_title, department,
           photo_url, contact_number, address, emergency_contact_name, emergency_contact_number, blood_type,
           date_issued, expiration_date, authorized_signatory, authorized_title, signature_url, back_notes,
           status, is_archived, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         [
+          bizId,
           cardNum,
           empRow ? empRow.id : null,
           employeeCode,
@@ -4297,8 +4866,10 @@ app.post(
           dateIssued,
           expirationDate,
           String(b.authorized_signatory ?? settings.authorized_representative ?? '').trim(),
-          String(b.authorized_title ?? settings.authorized_title ?? 'Authorized Representative').trim(),
-          String(b.signature_url ?? settings.signature_url ?? '').trim(),
+          String(
+            b.authorized_title ?? settings.authorized_title ?? 'Authorized Representative'
+          ).trim(),
+          sigUrl,
           String(b.back_notes || '').trim(),
           validStatus,
           now,
@@ -4306,18 +4877,17 @@ app.post(
         ]
       );
 
-      // Keep linked Employee Directory photo synchronized when updated on the ID card
       if (empRow && photoUrl !== empRow.photo_url) {
-        await dbRun('UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ?', [
-          photoUrl,
-          now,
-          empRow.id,
-        ]);
+        await dbRun(
+          'UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+          [photoUrl, now, empRow.id, bizId]
+        );
       }
 
       const newId = Number(info.lastInsertRowid);
       await saveIdempotencyKey(req, 'employee_id', newId);
       await logActivity({
+        business_id: bizId,
         entity_type: 'employee_id',
         entity_id: newId,
         document_number: cardNum,
@@ -4330,7 +4900,10 @@ app.post(
     });
 
     res.status(201).json({
-      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [createdId]),
+      id_card: await dbGet(
+        'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ?',
+        [createdId, bizId]
+      ),
     });
   })
 );
@@ -4339,9 +4912,10 @@ app.put(
   '/api/employee-id-cards/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
 
@@ -4352,6 +4926,17 @@ app.put(
           ? Number(b.employee_id)
           : null
         : existing.employee_id;
+
+    if (employeeId) {
+      const empCheck = await dbGet('SELECT id FROM employees WHERE id = ? AND business_id = ?', [
+        employeeId,
+        bizId,
+      ]);
+      if (!empCheck) {
+        return res.status(404).json({ error: 'Selected employee was not found in this business workspace.' });
+      }
+    }
+
     const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
     const fullName = String(b.full_name ?? existing.full_name).trim();
     const positionTitle = String(b.position_title ?? existing.position_title).trim();
@@ -4369,8 +4954,8 @@ app.put(
     }
 
     const conflictingDirectoryEmp = await dbGet(
-      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
-      [employeeCode]
+      'SELECT id, employee_code, full_name FROM employees WHERE business_id = ? AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+      [bizId, employeeCode]
     );
     if (conflictingDirectoryEmp && (!employeeId || conflictingDirectoryEmp.id !== employeeId)) {
       return res.status(409).json({
@@ -4381,12 +4966,13 @@ app.put(
     const activeCardCollision = await dbGet(
       `SELECT id, card_number, full_name
        FROM employee_id_cards
-       WHERE is_archived = 0
+       WHERE business_id = ?
+         AND is_archived = 0
          AND id != ?
          AND status = 'Active'
          AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
        LIMIT 1`,
-      [id, employeeCode]
+      [bizId, id, employeeCode]
     );
     if (activeCardCollision) {
       return res.status(409).json({
@@ -4394,7 +4980,17 @@ app.put(
       });
     }
 
-    const photoUrl = String(b.photo_url ?? existing.photo_url).trim();
+    const photoUrl = await assertAssetUrlBelongsToBusiness(
+      b.photo_url ?? existing.photo_url,
+      bizId,
+      'Employee photo'
+    );
+    const sigUrl = await assertAssetUrlBelongsToBusiness(
+      b.signature_url ?? existing.signature_url,
+      bizId,
+      'Authorized signature'
+    );
+
     const validStatus = ['Active', 'Expired', 'Revoked'].includes(b.status)
       ? b.status
       : existing.status;
@@ -4407,7 +5003,7 @@ app.put(
              photo_url = ?, contact_number = ?, address = ?, emergency_contact_name = ?, emergency_contact_number = ?, blood_type = ?,
              date_issued = ?, expiration_date = ?, authorized_signatory = ?, authorized_title = ?, signature_url = ?, back_notes = ?,
              status = ?, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND business_id = ?`,
         [
           employeeId,
           employeeCode,
@@ -4424,25 +5020,28 @@ app.put(
           expirationDate,
           String(b.authorized_signatory ?? existing.authorized_signatory).trim(),
           String(b.authorized_title ?? existing.authorized_title).trim(),
-          String(b.signature_url ?? existing.signature_url).trim(),
+          sigUrl,
           String(b.back_notes ?? existing.back_notes).trim(),
           validStatus,
           now,
           id,
+          bizId,
         ]
       );
 
       if (employeeId) {
-        await dbRun('UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ?', [
-          photoUrl,
-          now,
-          employeeId,
-        ]);
+        await dbRun(
+          'UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ? AND business_id = ?',
+          [photoUrl, now, employeeId, bizId]
+        );
       }
     });
 
     res.json({
-      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [id]),
+      id_card: await dbGet(
+        'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ?',
+        [id, bizId]
+      ),
     });
   })
 );
@@ -4451,35 +5050,40 @@ app.post(
   '/api/employee-id-cards/:id/regenerate',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
 
     const empRow = existing.employee_id
-      ? await dbGet('SELECT * FROM employees WHERE id = ?', [existing.employee_id])
+      ? await dbGet('SELECT * FROM employees WHERE id = ? AND business_id = ?', [
+          existing.employee_id,
+          bizId,
+        ])
       : null;
 
     const newCardId = await runInTransaction(async () => {
       const issueDate = req.body?.date_issued || todayYMD();
       const now = nowISO();
       await dbRun(
-        "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ?",
-        [now, id]
+        "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?",
+        [now, id, bizId]
       );
 
-      const cardNum = await allocateNextDocNumber('id_card', issueDate);
-      const settings = await getSettings();
+      const cardNum = await allocateNextDocNumber(bizId, 'id_card', issueDate);
+      const settings = await getSettings(bizId);
 
       const info = await dbRun(
         `INSERT INTO employee_id_cards (
-          card_number, employee_id, employee_code, full_name, position_title, department,
+          business_id, card_number, employee_id, employee_code, full_name, position_title, department,
           photo_url, contact_number, address, emergency_contact_name, emergency_contact_number, blood_type,
           date_issued, expiration_date, authorized_signatory, authorized_title, signature_url, back_notes,
           status, is_archived, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 0, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 0, ?, ?)`,
         [
+          bizId,
           cardNum,
           empRow ? empRow.id : existing.employee_id,
           empRow ? empRow.employee_code : existing.employee_code,
@@ -4504,6 +5108,7 @@ app.post(
       );
       const createdId = Number(info.lastInsertRowid);
       await logActivity({
+        business_id: bizId,
         entity_type: 'employee_id',
         entity_id: createdId,
         document_number: cardNum,
@@ -4516,7 +5121,10 @@ app.post(
     });
 
     res.status(201).json({
-      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [newCardId]),
+      id_card: await dbGet(
+        'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ?',
+        [newCardId, bizId]
+      ),
     });
   })
 );
@@ -4525,15 +5133,16 @@ app.delete(
   '/api/employee-id-cards/:id',
   asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
+    const bizId = req.businessId;
     const existing = await dbGet(
-      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-      [id]
+      'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [id, bizId]
     );
     if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
-    await dbRun('UPDATE employee_id_cards SET is_archived = 1, updated_at = ? WHERE id = ?', [
-      nowISO(),
-      id,
-    ]);
+    await dbRun(
+      'UPDATE employee_id_cards SET is_archived = 1, updated_at = ? WHERE id = ? AND business_id = ?',
+      [nowISO(), id, bizId]
+    );
     res.json({ ok: true });
   })
 );
@@ -4542,11 +5151,11 @@ app.get(
   '/api/employee-id-cards/:id/pdf',
   asyncHandler(async (req, res) => {
     const card = await dbGet(
-      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
-      [Number(req.params.id)]
+      'SELECT * FROM employee_id_cards WHERE id = ? AND business_id = ? AND is_archived = 0',
+      [Number(req.params.id), req.businessId]
     );
     if (!card) return res.status(404).json({ error: 'Employee ID card not found.' });
-    const settings = await getSettings();
+    const settings = await getSettings(req.businessId);
     const pdfBuf = await generateEmployeeIdPdf(card, settings);
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
@@ -4558,66 +5167,84 @@ app.get(
 );
 
 // ============================================================================
-// BACKUP, DATA EXPORT & RESTORE
+// BACKUP, DATA EXPORT & RESTORE (STRICTLY SCOPED TO ACTIVE BUSINESS)
 // ============================================================================
 
 app.get(
   '/api/backup/export',
-  asyncHandler(async (_req, res) => {
-    const tables = [
-      'business_settings',
-      'document_sequences',
-      'customers',
-      'products_services',
-      'quotations',
-      'quotation_items',
-      'invoices',
-      'invoice_items',
-      'payments',
-      'service_reports',
-      'service_report_materials',
-      'service_report_photos',
-      'billing_statements',
-      'billing_statement_lines',
-      'employees',
-      'payslips',
-      'certificates_of_employment',
-      'employee_id_cards',
-      'activity_logs',
-    ];
+  asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
+    const bizSlug = req.businessSlug;
 
-    const data = {};
-    for (const t of tables) {
-      data[t] = await dbAll(`SELECT * FROM ${t}`);
-    }
+    const data = {
+      business_settings: await dbAll('SELECT * FROM business_settings WHERE id = ? AND business_id = ?', [bizId, bizId]),
+      document_sequences: await dbAll('SELECT * FROM document_sequences WHERE business_id = ?', [bizId]),
+      customers: await dbAll('SELECT * FROM customers WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      products_services: await dbAll('SELECT * FROM products_services WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      quotations: await dbAll('SELECT * FROM quotations WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      quotation_items: await dbAll(
+        `SELECT qi.* FROM quotation_items qi
+         JOIN quotations q ON q.id = qi.quotation_id
+         WHERE q.business_id = ? ORDER BY qi.id ASC`,
+        [bizId]
+      ),
+      invoices: await dbAll('SELECT * FROM invoices WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      invoice_items: await dbAll(
+        `SELECT ii.* FROM invoice_items ii
+         JOIN invoices i ON i.id = ii.invoice_id
+         WHERE i.business_id = ? ORDER BY ii.id ASC`,
+        [bizId]
+      ),
+      payments: await dbAll('SELECT * FROM payments WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      service_reports: await dbAll('SELECT * FROM service_reports WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      service_report_materials: await dbAll(
+        `SELECT srm.* FROM service_report_materials srm
+         JOIN service_reports sr ON sr.id = srm.service_report_id
+         WHERE sr.business_id = ? ORDER BY srm.id ASC`,
+        [bizId]
+      ),
+      service_report_photos: await dbAll(
+        `SELECT srp.* FROM service_report_photos srp
+         JOIN service_reports sr ON sr.id = srp.service_report_id
+         WHERE sr.business_id = ? ORDER BY srp.id ASC`,
+        [bizId]
+      ),
+      billing_statements: await dbAll('SELECT * FROM billing_statements WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      billing_statement_lines: await dbAll(
+        `SELECT bsl.* FROM billing_statement_lines bsl
+         JOIN billing_statements bs ON bs.id = bsl.billing_statement_id
+         WHERE bs.business_id = ? ORDER BY bsl.id ASC`,
+        [bizId]
+      ),
+      employees: await dbAll('SELECT * FROM employees WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      payslips: await dbAll('SELECT * FROM payslips WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      certificates_of_employment: await dbAll('SELECT * FROM certificates_of_employment WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      employee_id_cards: await dbAll('SELECT * FROM employee_id_cards WHERE business_id = ? ORDER BY id ASC', [bizId]),
+      activity_logs: await dbAll('SELECT * FROM activity_logs WHERE business_id = ? ORDER BY id ASC', [bizId]),
+    };
 
-    // Export all uploaded files from persistent DB table + any legacy disk files
     const uploadedFiles = {};
-    const dbFiles = await dbAll('SELECT filename, data_base64 FROM uploaded_files');
+    const dbFiles = await dbAll(
+      'SELECT filename, data_base64 FROM uploaded_files WHERE business_id = ?',
+      [bizId]
+    );
     for (const row of dbFiles) {
       if (row.filename && row.data_base64) {
         uploadedFiles[row.filename] = row.data_base64;
       }
     }
-    if (fs.existsSync(UPLOADS_DIR)) {
-      for (const fname of fs.readdirSync(UPLOADS_DIR)) {
-        if (fname === '.gitkeep' || uploadedFiles[fname]) continue;
-        const fpath = path.join(UPLOADS_DIR, fname);
-        if (fs.statSync(fpath).isFile()) {
-          uploadedFiles[fname] = fs.readFileSync(fpath).toString('base64');
-        }
-      }
-    }
 
     const payload = {
-      system: 'Johnrois Stainless Steel Fabrication Shop — Business Management System',
-      backup_version: '1.1',
+      system: `${req.settings?.business_name || req.business.default_name} — Business Workspace Backup`,
+      business_id: bizId,
+      business_slug: bizSlug,
+      backup_version: '2.0',
       exported_at: nowISO(),
       tables: data,
       uploaded_files: uploadedFiles,
     };
 
-    const filename = `johnrois-backup-${todayYMD()}.json`;
+    const filename = `${bizSlug}-backup-${todayYMD()}.json`;
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(JSON.stringify(payload, null, 2));
@@ -4627,499 +5254,709 @@ app.get(
 app.post(
   '/api/backup/import',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
+    const bizSlug = req.businessSlug;
     const payload = req.body;
     if (!payload || !payload.tables || typeof payload.tables !== 'object') {
       return res.status(400).json({ error: 'Invalid backup file structure.' });
     }
 
-    const ALLOWED_COLUMNS = {
-      business_settings: [
-        'id',
-        'business_name',
-        'logo_url',
-        'address',
-        'contact_number',
-        'email',
-        'facebook_url',
-        'maps_url',
-        'other_social_links',
-        'operating_hours',
-        'quotation_prefix',
-        'invoice_prefix',
-        'service_report_prefix',
-        'billing_statement_prefix',
-        'customer_prefix',
-        'product_prefix',
-        'payment_prefix',
-        'employee_prefix',
-        'payslip_prefix',
-        'coe_prefix',
-        'id_card_prefix',
-        'doc_number_padding',
-        'include_year_in_doc_num',
-        'default_payment_terms',
-        'default_quotation_validity_days',
-        'default_invoice_due_days',
-        'default_notes',
-        'authorized_representative',
-        'authorized_title',
-        'signature_url',
-        'tax_enabled',
-        'tax_label',
-        'tax_rate',
-        'updated_at',
-      ],
-      document_sequences: ['seq_key', 'last_val'],
-      customers: [
-        'id',
-        'customer_code',
-        'customer_name',
-        'company_name',
-        'contact_number',
-        'email',
-        'billing_address',
-        'project_locations',
-        'remarks',
-        'is_archived',
-        'created_by',
-        'created_at',
-        'updated_at',
-      ],
-      products_services: [
-        'id',
-        'item_code',
-        'name',
-        'description',
-        'category',
-        'material_grade',
-        'unit',
-        'unit_price',
-        'is_archived',
-        'created_at',
-        'updated_at',
-      ],
-      quotations: [
-        'id',
-        'quotation_number',
-        'date_issued',
-        'valid_until',
-        'customer_id',
-        'customer_name',
-        'company_name',
-        'customer_address',
-        'contact_number',
-        'customer_email',
-        'project_name',
-        'project_location',
-        'subtotal',
-        'discount_type',
-        'discount_value',
-        'discount_amount',
-        'tax_enabled',
-        'tax_label',
-        'tax_rate',
-        'tax_amount',
-        'grand_total',
-        'payment_terms',
-        'delivery_schedule',
-        'remarks',
-        'prepared_by',
-        'authorized_signatory',
-        'status',
-        'converted_invoice_id',
-        'is_archived',
-        'created_by',
-        'created_at',
-        'updated_at',
-      ],
-      quotation_items: [
-        'id',
-        'quotation_id',
-        'product_id',
-        'sort_order',
-        'description',
-        'quantity',
-        'unit',
-        'unit_price',
-        'line_total',
-      ],
-      invoices: [
-        'id',
-        'invoice_number',
-        'invoice_date',
-        'due_date',
-        'customer_id',
-        'customer_name',
-        'company_name',
-        'customer_address',
-        'contact_number',
-        'customer_email',
-        'quotation_id',
-        'reference_quotation_number',
-        'project_name',
-        'subtotal',
-        'discount_type',
-        'discount_value',
-        'discount_amount',
-        'tax_enabled',
-        'tax_label',
-        'tax_rate',
-        'tax_amount',
-        'total_amount_due',
-        'amount_paid',
-        'remaining_balance',
-        'payment_method',
-        'payment_date',
-        'payment_terms',
-        'remarks',
-        'prepared_by',
-        'authorized_signatory',
-        'status',
-        'is_archived',
-        'created_by',
-        'created_at',
-        'updated_at',
-      ],
-      invoice_items: [
-        'id',
-        'invoice_id',
-        'product_id',
-        'sort_order',
-        'description',
-        'quantity',
-        'unit',
-        'unit_price',
-        'line_total',
-      ],
-      payments: [
-        'id',
-        'payment_number',
-        'invoice_id',
-        'customer_id',
-        'payment_date',
-        'amount',
-        'payment_method',
-        'reference_number',
-        'notes',
-        'recorded_by',
-        'created_at',
-        'updated_at',
-      ],
-      service_reports: [
-        'id',
-        'report_number',
-        'service_date',
-        'job_type',
-        'customer_id',
-        'customer_name',
-        'company_name',
-        'contact_details',
-        'service_location',
-        'equipment_serviced',
-        'reported_problem',
-        'inspection_findings',
-        'work_performed',
-        'materials_total_cost',
-        'technician_name',
-        'start_time',
-        'completion_time',
-        'status',
-        'recommendations',
-        'customer_acknowledgment',
-        'customer_signatory_name',
-        'acknowledgment_date',
-        'technician_signature_url',
-        'customer_signature_url',
-        'remarks',
-        'is_archived',
-        'created_by',
-        'created_at',
-        'updated_at',
-      ],
-      service_report_materials: [
-        'id',
-        'service_report_id',
-        'sort_order',
-        'material_name',
-        'quantity',
-        'unit',
-        'unit_cost',
-        'line_cost',
-      ],
-      service_report_photos: [
-        'id',
-        'service_report_id',
-        'photo_type',
-        'photo_url',
-        'caption',
-        'created_at',
-      ],
-      billing_statements: [
-        'id',
-        'statement_number',
-        'statement_date',
-        'period_from',
-        'period_to',
-        'customer_id',
-        'customer_name',
-        'company_name',
-        'customer_address',
-        'contact_number',
-        'customer_email',
-        'previous_balance',
-        'total_charges',
-        'total_payments',
-        'outstanding_balance',
-        'payment_terms',
-        'remarks',
-        'prepared_by',
-        'authorized_signatory',
-        'is_archived',
-        'created_by',
-        'created_at',
-        'updated_at',
-      ],
-      billing_statement_lines: [
-        'id',
-        'billing_statement_id',
-        'sort_order',
-        'tx_date',
-        'tx_type',
-        'source_id',
-        'reference_number',
-        'invoice_number',
-        'invoice_date',
-        'description',
-        'debit',
-        'credit',
-        'running_balance',
-      ],
-      employees: [
-        'id',
-        'employee_code',
-        'full_name',
-        'position_title',
-        'department',
-        'employment_type',
-        'employment_status',
-        'start_date',
-        'end_date',
-        'contact_number',
-        'email',
-        'address',
-        'emergency_contact_name',
-        'emergency_contact_number',
-        'pay_basis',
-        'default_rate',
-        'photo_url',
-        'notes',
-        'is_active',
-        'created_at',
-        'updated_at',
-      ],
-      payslips: [
-        'id',
-        'payslip_number',
-        'employee_id',
-        'employee_code',
-        'employee_name',
-        'position_title',
-        'department',
-        'pay_period_start',
-        'pay_period_end',
-        'payment_date',
-        'pay_basis',
-        'base_rate',
-        'days_worked',
-        'hours_worked',
-        'regular_pay',
-        'overtime_hours',
-        'overtime_rate',
-        'overtime_pay',
-        'allowances',
-        'bonuses',
-        'other_earnings',
-        'other_earnings_note',
-        'sss_deduction',
-        'philhealth_deduction',
-        'pagibig_deduction',
-        'withholding_tax',
-        'cash_advance',
-        'other_deductions',
-        'other_deductions_note',
-        'total_earnings',
-        'total_deductions',
-        'net_pay',
-        'payment_method',
-        'remarks',
-        'prepared_by',
-        'approved_by',
-        'employee_signature_url',
-        'status',
-        'is_archived',
-        'created_at',
-        'updated_at',
-      ],
-      certificates_of_employment: [
-        'id',
-        'certificate_number',
-        'employee_id',
-        'employee_code',
-        'employee_name',
-        'position_title',
-        'department',
-        'employment_type',
-        'employment_status',
-        'start_date',
-        'end_date',
-        'date_issued',
-        'purpose',
-        'include_salary',
-        'salary_amount',
-        'salary_period',
-        'custom_body',
-        'signatory_name',
-        'signatory_title',
-        'signature_url',
-        'remarks',
-        'is_archived',
-        'created_at',
-        'updated_at',
-      ],
-      employee_id_cards: [
-        'id',
-        'card_number',
-        'employee_id',
-        'employee_code',
-        'full_name',
-        'position_title',
-        'department',
-        'photo_url',
-        'contact_number',
-        'address',
-        'emergency_contact_name',
-        'emergency_contact_number',
-        'blood_type',
-        'date_issued',
-        'expiration_date',
-        'authorized_signatory',
-        'authorized_title',
-        'signature_url',
-        'back_notes',
-        'status',
-        'is_archived',
-        'created_at',
-        'updated_at',
-      ],
-      activity_logs: [
-        'id',
-        'entity_type',
-        'entity_id',
-        'document_number',
-        'customer_id',
-        'customer_name',
-        'action',
-        'summary',
-        'amount',
-        'actor_name',
-        'created_at',
-      ],
-    };
+    if (
+      payload.business_slug &&
+      resolveBusinessIdentity(payload.business_slug) &&
+      resolveBusinessIdentity(payload.business_slug).id !== bizId
+    ) {
+      return res.status(400).json({
+        error: `This backup file belongs to "${payload.business_slug}" and cannot be restored into "${bizSlug}".`,
+      });
+    }
 
     try {
+      const urlRemap = new Map();
       await runInTransaction(async () => {
-        // Delete child tables before parent tables so foreign keys remain satisfied on all engines
-        const orderedDelete = [
-          'employee_id_cards',
-          'certificates_of_employment',
-          'payslips',
-          'employees',
-          'billing_statement_lines',
-          'billing_statements',
-          'service_report_photos',
-          'service_report_materials',
-          'service_reports',
-          'payments',
-          'invoice_items',
-          'invoices',
-          'quotation_items',
-          'quotations',
-          'products_services',
-          'customers',
-          'document_sequences',
-          'idempotency_keys',
-          'activity_logs',
-        ];
+        // Delete ONLY this business's records in FK-safe order; never touch the other business!
+        await dbRun('DELETE FROM employee_id_cards WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM certificates_of_employment WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM payslips WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM employees WHERE business_id = ?', [bizId]);
+        await dbRun(
+          'DELETE FROM billing_statement_lines WHERE billing_statement_id IN (SELECT id FROM billing_statements WHERE business_id = ?)',
+          [bizId]
+        );
+        await dbRun('DELETE FROM billing_statements WHERE business_id = ?', [bizId]);
+        await dbRun(
+          'DELETE FROM service_report_photos WHERE service_report_id IN (SELECT id FROM service_reports WHERE business_id = ?)',
+          [bizId]
+        );
+        await dbRun(
+          'DELETE FROM service_report_materials WHERE service_report_id IN (SELECT id FROM service_reports WHERE business_id = ?)',
+          [bizId]
+        );
+        await dbRun('DELETE FROM service_reports WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM payments WHERE business_id = ?', [bizId]);
+        await dbRun(
+          'DELETE FROM invoice_items WHERE invoice_id IN (SELECT id FROM invoices WHERE business_id = ?)',
+          [bizId]
+        );
+        await dbRun('DELETE FROM invoices WHERE business_id = ?', [bizId]);
+        await dbRun(
+          'DELETE FROM quotation_items WHERE quotation_id IN (SELECT id FROM quotations WHERE business_id = ?)',
+          [bizId]
+        );
+        await dbRun('DELETE FROM quotations WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM products_services WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM customers WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM document_sequences WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM idempotency_keys WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM activity_logs WHERE business_id = ?', [bizId]);
+        await dbRun('DELETE FROM uploaded_files WHERE business_id = ?', [bizId]);
 
-        for (const t of orderedDelete) {
-          await dbRun(`DELETE FROM ${t}`);
+        if (payload.uploaded_files && typeof payload.uploaded_files === 'object') {
+          for (const [fname, b64] of Object.entries(payload.uploaded_files)) {
+            const safeOrig = path.basename(fname);
+            if (safeOrig && typeof b64 === 'string') {
+              const saved = await saveUploadedFile({
+                businessId: bizId,
+                filename: safeOrig,
+                buffer: Buffer.from(b64, 'base64'),
+              });
+              urlRemap.set(safeOrig, saved.url);
+            }
+          }
         }
 
-        const insertRows = async (tableName, rows) => {
-          if (!Array.isArray(rows) || rows.length === 0) return;
-          const allowed = new Set(ALLOWED_COLUMNS[tableName] || []);
-          const cols = Object.keys(rows[0]).filter((c) => allowed.has(c));
-          if (cols.length === 0) return;
-          const placeholders = cols.map(() => '?').join(', ');
-          const sql = `INSERT INTO ${tableName} (${cols.join(', ')}) VALUES (${placeholders})`;
-          for (const r of rows) {
-            const values = cols.map((c) => (c === 'created_by' ? null : (r[c] ?? null)));
-            await dbRun(sql, values);
-          }
+        const remapAssetUrl = (raw) => {
+          const val = String(raw ?? '').trim();
+          if (!val) return '';
+          const base = path.basename(val);
+          if (urlRemap.has(base)) return urlRemap.get(base);
+          return val;
         };
 
+        // Restore business_settings for THIS business only
         if (
           Array.isArray(payload.tables.business_settings) &&
           payload.tables.business_settings.length > 0
         ) {
-          await dbRun('DELETE FROM business_settings');
-          await insertRows('business_settings', payload.tables.business_settings);
+          const s = payload.tables.business_settings[0];
+          await dbRun(
+            `UPDATE business_settings
+             SET business_name = ?, logo_url = ?, address = ?, contact_number = ?, email = ?,
+                 facebook_url = ?, maps_url = ?, other_social_links = ?, operating_hours = ?,
+                 quotation_prefix = ?, invoice_prefix = ?, service_report_prefix = ?, billing_statement_prefix = ?,
+                 customer_prefix = ?, product_prefix = ?, payment_prefix = ?,
+                 employee_prefix = ?, payslip_prefix = ?, coe_prefix = ?, id_card_prefix = ?,
+                 doc_number_padding = ?, include_year_in_doc_num = ?, default_payment_terms = ?,
+                 default_quotation_validity_days = ?, default_invoice_due_days = ?, default_notes = ?,
+                 authorized_representative = ?, authorized_title = ?, signature_url = ?,
+                 tax_enabled = ?, tax_label = ?, tax_rate = ?, updated_at = ?
+             WHERE id = ? AND business_id = ?`,
+            [
+              String(s.business_name || req.business.default_name),
+              remapAssetUrl(s.logo_url),
+              String(s.address ?? ''),
+              String(s.contact_number ?? ''),
+              String(s.email ?? ''),
+              String(s.facebook_url ?? ''),
+              String(s.maps_url ?? ''),
+              String(s.other_social_links ?? ''),
+              String(s.operating_hours ?? ''),
+              String(s.quotation_prefix || 'QTN'),
+              String(s.invoice_prefix || 'INV'),
+              String(s.service_report_prefix || 'SR'),
+              String(s.billing_statement_prefix || 'SOA'),
+              String(s.customer_prefix || 'CUST'),
+              String(s.product_prefix || 'ITEM'),
+              String(s.payment_prefix || 'PAY'),
+              String(s.employee_prefix || 'EMP'),
+              String(s.payslip_prefix || 'PSL'),
+              String(s.coe_prefix || 'COE'),
+              String(s.id_card_prefix || 'IDC'),
+              Number(s.doc_number_padding) || 4,
+              s.include_year_in_doc_num ? 1 : 0,
+              String(s.default_payment_terms ?? ''),
+              Number(s.default_quotation_validity_days) || 15,
+              Number(s.default_invoice_due_days) || 15,
+              String(s.default_notes ?? ''),
+              String(s.authorized_representative ?? ''),
+              String(s.authorized_title ?? 'Authorized Representative'),
+              remapAssetUrl(s.signature_url),
+              s.tax_enabled ? 1 : 0,
+              String(s.tax_label || 'VAT'),
+              Number(s.tax_rate) || 0,
+              s.updated_at || nowISO(),
+              bizId,
+              bizId,
+            ]
+          );
         }
 
-        const orderedInsert = [
-          'document_sequences',
-          'customers',
-          'products_services',
-          'quotations',
-          'quotation_items',
-          'invoices',
-          'invoice_items',
-          'payments',
-          'service_reports',
-          'service_report_materials',
-          'service_report_photos',
-          'billing_statements',
-          'billing_statement_lines',
-          'employees',
-          'payslips',
-          'certificates_of_employment',
-          'employee_id_cards',
-          'activity_logs',
-        ];
-        for (const t of orderedInsert) {
-          await insertRows(t, payload.tables[t]);
+        // Restore document_sequences scoped to this business
+        for (const seq of payload.tables.document_sequences || []) {
+          if (!seq?.seq_key) continue;
+          const rawKey = String(seq.seq_key).replace(/^BIZ\d+:/, '');
+          const scopedKey = `BIZ${bizId}:${rawKey}`;
+          await dbRun(
+            `INSERT INTO document_sequences (seq_key, business_id, last_val)
+             VALUES (?, ?, ?)
+             ON CONFLICT (seq_key) DO UPDATE SET last_val = EXCLUDED.last_val`,
+            [scopedKey, bizId, Number(seq.last_val) || 0]
+          );
+        }
+
+        const customerMap = new Map();
+        for (const c of payload.tables.customers || []) {
+          const info = await dbRun(
+            `INSERT INTO customers (
+              business_id, customer_code, customer_name, company_name, contact_number, email,
+              billing_address, project_locations, remarks, is_archived, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+            [
+              bizId,
+              c.customer_code,
+              c.customer_name,
+              c.company_name || '',
+              c.contact_number || '',
+              c.email || '',
+              c.billing_address || '',
+              c.project_locations || '',
+              c.remarks || '',
+              c.is_archived ? 1 : 0,
+              c.created_at || nowISO(),
+              c.updated_at || nowISO(),
+            ]
+          );
+          customerMap.set(Number(c.id), Number(info.lastInsertRowid));
+        }
+
+        const productMap = new Map();
+        for (const p of payload.tables.products_services || []) {
+          const info = await dbRun(
+            `INSERT INTO products_services (
+              business_id, item_code, name, description, category, material_grade, unit, unit_price, is_archived, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              p.item_code,
+              p.name,
+              p.description || '',
+              p.category || 'Fabrication',
+              p.material_grade || '',
+              p.unit || 'unit',
+              Number(p.unit_price) || 0,
+              p.is_archived ? 1 : 0,
+              p.created_at || nowISO(),
+              p.updated_at || nowISO(),
+            ]
+          );
+          productMap.set(Number(p.id), Number(info.lastInsertRowid));
+        }
+
+        const quotationMap = new Map();
+        const pendingQuoteConvertedLinks = [];
+        for (const q of payload.tables.quotations || []) {
+          const info = await dbRun(
+            `INSERT INTO quotations (
+              business_id, quotation_number, date_issued, valid_until, customer_id, customer_name, company_name,
+              customer_address, contact_number, customer_email, project_name, project_location,
+              subtotal, discount_type, discount_value, discount_amount,
+              tax_enabled, tax_label, tax_rate, tax_amount, grand_total,
+              payment_terms, delivery_schedule, remarks, prepared_by, authorized_signatory,
+              status, converted_invoice_id, is_archived, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)`,
+            [
+              bizId,
+              q.quotation_number,
+              q.date_issued,
+              q.valid_until || '',
+              q.customer_id ? customerMap.get(Number(q.customer_id)) || null : null,
+              q.customer_name,
+              q.company_name || '',
+              q.customer_address || '',
+              q.contact_number || '',
+              q.customer_email || '',
+              q.project_name || '',
+              q.project_location || '',
+              Number(q.subtotal) || 0,
+              q.discount_type || 'fixed',
+              Number(q.discount_value) || 0,
+              Number(q.discount_amount) || 0,
+              q.tax_enabled ? 1 : 0,
+              q.tax_label || 'VAT',
+              Number(q.tax_rate) || 0,
+              Number(q.tax_amount) || 0,
+              Number(q.grand_total) || 0,
+              q.payment_terms || '',
+              q.delivery_schedule || '',
+              q.remarks || '',
+              q.prepared_by || '',
+              q.authorized_signatory || '',
+              q.status || 'Draft',
+              q.is_archived ? 1 : 0,
+              q.created_at || nowISO(),
+              q.updated_at || nowISO(),
+            ]
+          );
+          const newQId = Number(info.lastInsertRowid);
+          quotationMap.set(Number(q.id), newQId);
+          if (q.converted_invoice_id) {
+            pendingQuoteConvertedLinks.push([newQId, Number(q.converted_invoice_id)]);
+          }
+        }
+
+        for (const qi of payload.tables.quotation_items || []) {
+          const newQId = quotationMap.get(Number(qi.quotation_id));
+          if (!newQId) continue;
+          await dbRun(
+            `INSERT INTO quotation_items (quotation_id, product_id, sort_order, description, quantity, unit, unit_price, line_total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              newQId,
+              qi.product_id ? productMap.get(Number(qi.product_id)) || null : null,
+              Number(qi.sort_order) || 0,
+              qi.description,
+              Number(qi.quantity) || 0,
+              qi.unit || 'pcs',
+              Number(qi.unit_price) || 0,
+              Number(qi.line_total) || 0,
+            ]
+          );
+        }
+
+        const invoiceMap = new Map();
+        for (const inv of payload.tables.invoices || []) {
+          const info = await dbRun(
+            `INSERT INTO invoices (
+              business_id, invoice_number, invoice_date, due_date, customer_id, customer_name, company_name,
+              customer_address, contact_number, customer_email, quotation_id, reference_quotation_number,
+              project_name, subtotal, discount_type, discount_value, discount_amount,
+              tax_enabled, tax_label, tax_rate, tax_amount, total_amount_due,
+              amount_paid, remaining_balance, payment_method, payment_date,
+              payment_terms, remarks, prepared_by, authorized_signatory,
+              status, is_archived, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+            [
+              bizId,
+              inv.invoice_number,
+              inv.invoice_date,
+              inv.due_date || '',
+              inv.customer_id ? customerMap.get(Number(inv.customer_id)) || null : null,
+              inv.customer_name,
+              inv.company_name || '',
+              inv.customer_address || '',
+              inv.contact_number || '',
+              inv.customer_email || '',
+              inv.quotation_id ? quotationMap.get(Number(inv.quotation_id)) || null : null,
+              inv.reference_quotation_number || '',
+              inv.project_name || '',
+              Number(inv.subtotal) || 0,
+              inv.discount_type || 'fixed',
+              Number(inv.discount_value) || 0,
+              Number(inv.discount_amount) || 0,
+              inv.tax_enabled ? 1 : 0,
+              inv.tax_label || 'VAT',
+              Number(inv.tax_rate) || 0,
+              Number(inv.tax_amount) || 0,
+              Number(inv.total_amount_due) || 0,
+              Number(inv.amount_paid) || 0,
+              Number(inv.remaining_balance) || 0,
+              inv.payment_method || '',
+              inv.payment_date || '',
+              inv.payment_terms || '',
+              inv.remarks || '',
+              inv.prepared_by || '',
+              inv.authorized_signatory || '',
+              inv.status || 'Unpaid',
+              inv.is_archived ? 1 : 0,
+              inv.created_at || nowISO(),
+              inv.updated_at || nowISO(),
+            ]
+          );
+          invoiceMap.set(Number(inv.id), Number(info.lastInsertRowid));
+        }
+
+        for (const [newQId, oldInvId] of pendingQuoteConvertedLinks) {
+          const newInvId = invoiceMap.get(oldInvId);
+          if (newInvId) {
+            await dbRun(
+              'UPDATE quotations SET converted_invoice_id = ? WHERE id = ? AND business_id = ?',
+              [newInvId, newQId, bizId]
+            );
+          }
+        }
+
+        for (const ii of payload.tables.invoice_items || []) {
+          const newInvId = invoiceMap.get(Number(ii.invoice_id));
+          if (!newInvId) continue;
+          await dbRun(
+            `INSERT INTO invoice_items (invoice_id, product_id, sort_order, description, quantity, unit, unit_price, line_total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              newInvId,
+              ii.product_id ? productMap.get(Number(ii.product_id)) || null : null,
+              Number(ii.sort_order) || 0,
+              ii.description,
+              Number(ii.quantity) || 0,
+              ii.unit || 'pcs',
+              Number(ii.unit_price) || 0,
+              Number(ii.line_total) || 0,
+            ]
+          );
+        }
+
+        const paymentMap = new Map();
+        for (const pay of payload.tables.payments || []) {
+          const newInvId = invoiceMap.get(Number(pay.invoice_id));
+          if (!newInvId) continue;
+          const info = await dbRun(
+            `INSERT INTO payments (
+              business_id, payment_number, invoice_id, customer_id, payment_date, amount,
+              payment_method, reference_number, notes, recorded_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              pay.payment_number,
+              newInvId,
+              pay.customer_id ? customerMap.get(Number(pay.customer_id)) || null : null,
+              pay.payment_date,
+              Number(pay.amount) || 0,
+              pay.payment_method || 'Cash',
+              pay.reference_number || '',
+              pay.notes || '',
+              pay.recorded_by || '',
+              pay.created_at || nowISO(),
+              pay.updated_at || nowISO(),
+            ]
+          );
+          paymentMap.set(Number(pay.id), Number(info.lastInsertRowid));
+        }
+
+        const serviceReportMap = new Map();
+        for (const sr of payload.tables.service_reports || []) {
+          const info = await dbRun(
+            `INSERT INTO service_reports (
+              business_id, report_number, service_date, job_type, customer_id, customer_name, company_name,
+              contact_details, service_location, equipment_serviced, reported_problem,
+              inspection_findings, work_performed, materials_total_cost, technician_name,
+              start_time, completion_time, status, recommendations, customer_acknowledgment,
+              customer_signatory_name, acknowledgment_date, technician_signature_url,
+              customer_signature_url, remarks, is_archived, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+            [
+              bizId,
+              sr.report_number,
+              sr.service_date,
+              sr.job_type || 'Fabrication',
+              sr.customer_id ? customerMap.get(Number(sr.customer_id)) || null : null,
+              sr.customer_name,
+              sr.company_name || '',
+              sr.contact_details || '',
+              sr.service_location || '',
+              sr.equipment_serviced || '',
+              sr.reported_problem || '',
+              sr.inspection_findings || '',
+              sr.work_performed || '',
+              Number(sr.materials_total_cost) || 0,
+              sr.technician_name || '',
+              sr.start_time || '',
+              sr.completion_time || '',
+              sr.status || 'Scheduled',
+              sr.recommendations || '',
+              sr.customer_acknowledgment ? 1 : 0,
+              sr.customer_signatory_name || '',
+              sr.acknowledgment_date || '',
+              remapAssetUrl(sr.technician_signature_url),
+              remapAssetUrl(sr.customer_signature_url),
+              sr.remarks || '',
+              sr.is_archived ? 1 : 0,
+              sr.created_at || nowISO(),
+              sr.updated_at || nowISO(),
+            ]
+          );
+          serviceReportMap.set(Number(sr.id), Number(info.lastInsertRowid));
+        }
+
+        for (const m of payload.tables.service_report_materials || []) {
+          const newSrId = serviceReportMap.get(Number(m.service_report_id));
+          if (!newSrId) continue;
+          await dbRun(
+            `INSERT INTO service_report_materials (service_report_id, sort_order, material_name, quantity, unit, unit_cost, line_cost)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              newSrId,
+              Number(m.sort_order) || 0,
+              m.material_name,
+              Number(m.quantity) || 0,
+              m.unit || 'pcs',
+              Number(m.unit_cost) || 0,
+              Number(m.line_cost) || 0,
+            ]
+          );
+        }
+
+        for (const p of payload.tables.service_report_photos || []) {
+          const newSrId = serviceReportMap.get(Number(p.service_report_id));
+          if (!newSrId) continue;
+          await dbRun(
+            `INSERT INTO service_report_photos (service_report_id, photo_type, photo_url, caption, created_at)
+             VALUES (?, ?, ?, ?, ?)`,
+            [
+              newSrId,
+              p.photo_type === 'after' ? 'after' : 'before',
+              remapAssetUrl(p.photo_url),
+              p.caption || '',
+              p.created_at || nowISO(),
+            ]
+          );
+        }
+
+        const statementMap = new Map();
+        for (const bs of payload.tables.billing_statements || []) {
+          const newCustId = customerMap.get(Number(bs.customer_id));
+          if (!newCustId) continue;
+          const info = await dbRun(
+            `INSERT INTO billing_statements (
+              business_id, statement_number, statement_date, period_from, period_to,
+              customer_id, customer_name, company_name, customer_address, contact_number, customer_email,
+              previous_balance, total_charges, total_payments, outstanding_balance,
+              payment_terms, remarks, prepared_by, authorized_signatory,
+              is_archived, created_by, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+            [
+              bizId,
+              bs.statement_number,
+              bs.statement_date,
+              bs.period_from,
+              bs.period_to,
+              newCustId,
+              bs.customer_name,
+              bs.company_name || '',
+              bs.customer_address || '',
+              bs.contact_number || '',
+              bs.customer_email || '',
+              Number(bs.previous_balance) || 0,
+              Number(bs.total_charges) || 0,
+              Number(bs.total_payments) || 0,
+              Number(bs.outstanding_balance) || 0,
+              bs.payment_terms || '',
+              bs.remarks || '',
+              bs.prepared_by || '',
+              bs.authorized_signatory || '',
+              bs.is_archived ? 1 : 0,
+              bs.created_at || nowISO(),
+              bs.updated_at || nowISO(),
+            ]
+          );
+          statementMap.set(Number(bs.id), Number(info.lastInsertRowid));
+        }
+
+        for (const bsl of payload.tables.billing_statement_lines || []) {
+          const newBsId = statementMap.get(Number(bsl.billing_statement_id));
+          if (!newBsId) continue;
+          const mappedSourceId =
+            bsl.tx_type === 'invoice'
+              ? invoiceMap.get(Number(bsl.source_id)) || Number(bsl.source_id) || 0
+              : paymentMap.get(Number(bsl.source_id)) || Number(bsl.source_id) || 0;
+          await dbRun(
+            `INSERT INTO billing_statement_lines (
+              billing_statement_id, sort_order, tx_date, tx_type, source_id,
+              reference_number, invoice_number, invoice_date, description, debit, credit, running_balance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              newBsId,
+              Number(bsl.sort_order) || 0,
+              bsl.tx_date,
+              bsl.tx_type === 'payment' ? 'payment' : 'invoice',
+              mappedSourceId,
+              bsl.reference_number,
+              bsl.invoice_number || '',
+              bsl.invoice_date || '',
+              bsl.description,
+              Number(bsl.debit) || 0,
+              Number(bsl.credit) || 0,
+              Number(bsl.running_balance) || 0,
+            ]
+          );
+        }
+
+        const employeeMap = new Map();
+        for (const emp of payload.tables.employees || []) {
+          const info = await dbRun(
+            `INSERT INTO employees (
+              business_id, employee_code, full_name, position_title, department, employment_type, employment_status,
+              start_date, end_date, contact_number, email, address,
+              emergency_contact_name, emergency_contact_number,
+              pay_basis, default_rate, photo_url, notes, is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              emp.employee_code,
+              emp.full_name,
+              emp.position_title,
+              emp.department || '',
+              emp.employment_type || 'Regular',
+              emp.employment_status || 'Active',
+              emp.start_date || '',
+              emp.end_date || '',
+              emp.contact_number || '',
+              emp.email || '',
+              emp.address || '',
+              emp.emergency_contact_name || '',
+              emp.emergency_contact_number || '',
+              emp.pay_basis || 'daily',
+              Number(emp.default_rate) || 0,
+              remapAssetUrl(emp.photo_url),
+              emp.notes || '',
+              emp.is_active !== undefined ? (emp.is_active ? 1 : 0) : 1,
+              emp.created_at || nowISO(),
+              emp.updated_at || nowISO(),
+            ]
+          );
+          employeeMap.set(Number(emp.id), Number(info.lastInsertRowid));
+        }
+
+        for (const psl of payload.tables.payslips || []) {
+          await dbRun(
+            `INSERT INTO payslips (
+              business_id, payslip_number, employee_id, employee_code, employee_name, position_title, department,
+              pay_period_start, pay_period_end, payment_date,
+              pay_basis, base_rate, days_worked, hours_worked, regular_pay,
+              overtime_hours, overtime_rate, overtime_pay,
+              allowances, bonuses, other_earnings, other_earnings_note,
+              sss_deduction, philhealth_deduction, pagibig_deduction, withholding_tax, cash_advance, other_deductions, other_deductions_note,
+              total_earnings, total_deductions, net_pay,
+              payment_method, remarks, prepared_by, approved_by, employee_signature_url,
+              status, is_archived, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              psl.payslip_number,
+              psl.employee_id ? employeeMap.get(Number(psl.employee_id)) || null : null,
+              psl.employee_code,
+              psl.employee_name,
+              psl.position_title || '',
+              psl.department || '',
+              psl.pay_period_start,
+              psl.pay_period_end,
+              psl.payment_date,
+              psl.pay_basis || 'daily',
+              Number(psl.base_rate) || 0,
+              Number(psl.days_worked) || 0,
+              Number(psl.hours_worked) || 0,
+              Number(psl.regular_pay) || 0,
+              Number(psl.overtime_hours) || 0,
+              Number(psl.overtime_rate) || 0,
+              Number(psl.overtime_pay) || 0,
+              Number(psl.allowances) || 0,
+              Number(psl.bonuses) || 0,
+              Number(psl.other_earnings) || 0,
+              psl.other_earnings_note || '',
+              Number(psl.sss_deduction) || 0,
+              Number(psl.philhealth_deduction) || 0,
+              Number(psl.pagibig_deduction) || 0,
+              Number(psl.withholding_tax) || 0,
+              Number(psl.cash_advance) || 0,
+              Number(psl.other_deductions) || 0,
+              psl.other_deductions_note || '',
+              Number(psl.total_earnings) || 0,
+              Number(psl.total_deductions) || 0,
+              Number(psl.net_pay) || 0,
+              psl.payment_method || 'Cash',
+              psl.remarks || '',
+              psl.prepared_by || '',
+              psl.approved_by || '',
+              remapAssetUrl(psl.employee_signature_url),
+              psl.status || 'Issued',
+              psl.is_archived ? 1 : 0,
+              psl.created_at || nowISO(),
+              psl.updated_at || nowISO(),
+            ]
+          );
+        }
+
+        for (const coe of payload.tables.certificates_of_employment || []) {
+          await dbRun(
+            `INSERT INTO certificates_of_employment (
+              business_id, certificate_number, employee_id, employee_code, employee_name, position_title, department,
+              employment_type, employment_status, start_date, end_date, date_issued, purpose,
+              include_salary, salary_amount, salary_period, custom_body,
+              signatory_name, signatory_title, signature_url, remarks,
+              is_archived, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              coe.certificate_number,
+              coe.employee_id ? employeeMap.get(Number(coe.employee_id)) || null : null,
+              coe.employee_code || '',
+              coe.employee_name,
+              coe.position_title,
+              coe.department || '',
+              coe.employment_type || '',
+              coe.employment_status,
+              coe.start_date,
+              coe.end_date || '',
+              coe.date_issued,
+              coe.purpose || '',
+              coe.include_salary ? 1 : 0,
+              Number(coe.salary_amount) || 0,
+              coe.salary_period || 'monthly',
+              coe.custom_body || '',
+              coe.signatory_name || '',
+              coe.signatory_title || '',
+              remapAssetUrl(coe.signature_url),
+              coe.remarks || '',
+              coe.is_archived ? 1 : 0,
+              coe.created_at || nowISO(),
+              coe.updated_at || nowISO(),
+            ]
+          );
+        }
+
+        for (const ic of payload.tables.employee_id_cards || []) {
+          await dbRun(
+            `INSERT INTO employee_id_cards (
+              business_id, card_number, employee_id, employee_code, full_name, position_title, department,
+              photo_url, contact_number, address, emergency_contact_name, emergency_contact_number, blood_type,
+              date_issued, expiration_date, authorized_signatory, authorized_title, signature_url, back_notes,
+              status, is_archived, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              bizId,
+              ic.card_number,
+              ic.employee_id ? employeeMap.get(Number(ic.employee_id)) || null : null,
+              ic.employee_code,
+              ic.full_name,
+              ic.position_title,
+              ic.department || '',
+              remapAssetUrl(ic.photo_url),
+              ic.contact_number || '',
+              ic.address || '',
+              ic.emergency_contact_name || '',
+              ic.emergency_contact_number || '',
+              ic.blood_type || '',
+              ic.date_issued,
+              ic.expiration_date || '',
+              ic.authorized_signatory || '',
+              ic.authorized_title || '',
+              remapAssetUrl(ic.signature_url),
+              ic.back_notes || '',
+              ic.status || 'Active',
+              ic.is_archived ? 1 : 0,
+              ic.created_at || nowISO(),
+              ic.updated_at || nowISO(),
+            ]
+          );
         }
       });
 
       await syncSequencesAfterRestore();
 
-      if (payload.uploaded_files && typeof payload.uploaded_files === 'object') {
-        for (const [fname, b64] of Object.entries(payload.uploaded_files)) {
-          const safeName = path.basename(fname);
-          if (safeName && typeof b64 === 'string') {
-            await saveUploadedFile({
-              filename: safeName,
-              buffer: Buffer.from(b64, 'base64'),
-            });
-          }
-        }
-      }
-
       await logActivity({
+        business_id: bizId,
         entity_type: 'settings',
-        entity_id: 1,
+        entity_id: bizId,
         action: 'backup_restored',
-        summary: 'Restored system database from backup file',
+        summary: 'Restored business workspace database from backup file',
         actor_name: req.user.full_name,
       });
 
@@ -5134,36 +5971,38 @@ app.post(
 app.get(
   '/api/backup/export-csv/:entity',
   asyncHandler(async (req, res) => {
+    const bizId = req.businessId;
+    const bizSlug = req.businessSlug;
     const entity = req.params.entity;
     const queryMap = {
       customers:
-        'SELECT customer_code, customer_name, company_name, contact_number, email, billing_address, project_locations, remarks, created_at FROM customers WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT customer_code, customer_name, company_name, contact_number, email, billing_address, project_locations, remarks, created_at FROM customers WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       products:
-        'SELECT item_code, name, category, material_grade, unit, unit_price, description, created_at FROM products_services WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT item_code, name, category, material_grade, unit, unit_price, description, created_at FROM products_services WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       quotations:
-        'SELECT quotation_number, date_issued, valid_until, customer_name, company_name, project_name, subtotal, discount_amount, tax_amount, grand_total, status, created_at FROM quotations WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT quotation_number, date_issued, valid_until, customer_name, company_name, project_name, subtotal, discount_amount, tax_amount, grand_total, status, created_at FROM quotations WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       invoices:
-        'SELECT invoice_number, invoice_date, due_date, customer_name, company_name, reference_quotation_number, total_amount_due, amount_paid, remaining_balance, status, created_at FROM invoices WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT invoice_number, invoice_date, due_date, customer_name, company_name, reference_quotation_number, total_amount_due, amount_paid, remaining_balance, status, created_at FROM invoices WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       payments:
-        'SELECT p.payment_number, p.payment_date, i.invoice_number, i.customer_name, p.amount, p.payment_method, p.reference_number, p.recorded_by FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE i.is_archived = 0 ORDER BY p.id ASC',
+        'SELECT p.payment_number, p.payment_date, i.invoice_number, i.customer_name, p.amount, p.payment_method, p.reference_number, p.recorded_by FROM payments p JOIN invoices i ON i.id = p.invoice_id AND i.business_id = p.business_id WHERE p.business_id = ? AND i.is_archived = 0 ORDER BY p.id ASC',
       'service-reports':
-        'SELECT report_number, service_date, job_type, customer_name, service_location, equipment_serviced, technician_name, materials_total_cost, status, created_at FROM service_reports WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT report_number, service_date, job_type, customer_name, service_location, equipment_serviced, technician_name, materials_total_cost, status, created_at FROM service_reports WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       'billing-statements':
-        'SELECT statement_number, statement_date, period_from, period_to, customer_name, previous_balance, total_charges, total_payments, outstanding_balance, created_at FROM billing_statements WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT statement_number, statement_date, period_from, period_to, customer_name, previous_balance, total_charges, total_payments, outstanding_balance, created_at FROM billing_statements WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       employees:
-        'SELECT employee_code, full_name, position_title, department, employment_type, employment_status, start_date, end_date, contact_number, email, address, emergency_contact_name, emergency_contact_number, pay_basis, default_rate, is_active, created_at FROM employees ORDER BY id ASC',
+        'SELECT employee_code, full_name, position_title, department, employment_type, employment_status, start_date, end_date, contact_number, email, address, emergency_contact_name, emergency_contact_number, pay_basis, default_rate, is_active, created_at FROM employees WHERE business_id = ? ORDER BY id ASC',
       payslips:
-        'SELECT payslip_number, employee_code, employee_name, position_title, pay_period_start, pay_period_end, payment_date, pay_basis, base_rate, regular_pay, overtime_pay, allowances, bonuses, other_earnings, total_earnings, sss_deduction, philhealth_deduction, pagibig_deduction, withholding_tax, cash_advance, other_deductions, total_deductions, net_pay, status, created_at FROM payslips WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT payslip_number, employee_code, employee_name, position_title, pay_period_start, pay_period_end, payment_date, pay_basis, base_rate, regular_pay, overtime_pay, allowances, bonuses, other_earnings, total_earnings, sss_deduction, philhealth_deduction, pagibig_deduction, withholding_tax, cash_advance, other_deductions, total_deductions, net_pay, status, created_at FROM payslips WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       'certificates-of-employment':
-        'SELECT certificate_number, employee_code, employee_name, position_title, department, employment_status, start_date, end_date, date_issued, purpose, include_salary, salary_amount, salary_period, signatory_name, created_at FROM certificates_of_employment WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT certificate_number, employee_code, employee_name, position_title, department, employment_status, start_date, end_date, date_issued, purpose, include_salary, salary_amount, salary_period, signatory_name, created_at FROM certificates_of_employment WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
       'employee-id-cards':
-        'SELECT card_number, employee_code, full_name, position_title, department, date_issued, expiration_date, emergency_contact_name, emergency_contact_number, status, created_at FROM employee_id_cards WHERE is_archived = 0 ORDER BY id ASC',
+        'SELECT card_number, employee_code, full_name, position_title, department, date_issued, expiration_date, emergency_contact_name, emergency_contact_number, status, created_at FROM employee_id_cards WHERE business_id = ? AND is_archived = 0 ORDER BY id ASC',
     };
 
     const sql = queryMap[entity];
     if (!sql) return res.status(400).json({ error: 'Unknown export entity.' });
 
-    const rows = await dbAll(sql);
+    const rows = await dbAll(sql, [bizId]);
     const cols = rows.length > 0 ? Object.keys(rows[0]) : ['no_records'];
     const escapeCsv = (v) => {
       const s = String(v ?? '');
@@ -5180,7 +6019,7 @@ app.get(
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="johnrois-${entity}-${todayYMD()}.csv"`
+      `attachment; filename="${bizSlug}-${entity}-${todayYMD()}.csv"`
     );
     res.send('\uFEFF' + lines.join('\r\n'));
   })
@@ -5221,7 +6060,9 @@ app.use((err, _req, res, _next) => {
   if (err instanceof SyntaxError && 'body' in err) {
     return res.status(400).json({ error: 'Malformed JSON request body.' });
   }
-  console.error('Server error:', err);
+  if (!err?.status || err.status >= 500) {
+    console.error('Server error:', err);
+  }
   res.status(err?.status || 500).json({
     error: err?.message || 'An unexpected server error occurred.',
   });
@@ -5237,7 +6078,7 @@ if (isDirectEntry && !process.env.VERCEL && process.env.NO_LISTEN !== '1') {
   ensureDbReady()
     .then(() => {
       app.listen(PORT, '0.0.0.0', () => {
-        console.log(`Johnrois Business Management System running on http://0.0.0.0:${PORT}`);
+        console.log(`Multi-Business Management System running on http://0.0.0.0:${PORT}`);
       });
     })
     .catch((err) => {

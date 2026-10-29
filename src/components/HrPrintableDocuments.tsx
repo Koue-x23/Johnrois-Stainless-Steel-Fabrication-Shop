@@ -1,11 +1,11 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   BusinessSettings,
   CertificateOfEmployment,
   EmployeeIdCard,
   Payslip,
 } from '../types';
-import { formatDate, formatPHP, resolveAssetUrl } from '../lib/api';
+import { formatDate, formatPHP, getBusinessMonogram, resolveAssetUrl } from '../lib/api';
 
 const PAY_BASIS_LABELS: Record<string, string> = {
   daily: 'Daily Rate',
@@ -99,6 +99,9 @@ export const PrintablePayslip: React.FC<{
               <img
                 src={resolveAssetUrl(settings.logo_url)}
                 alt={settings.business_name}
+                onError={(e) => {
+                  (e.currentTarget as HTMLImageElement).style.display = 'none';
+                }}
                 className="w-14 h-14 object-contain shrink-0"
               />
             )}
@@ -320,7 +323,7 @@ export const PrintableCoe: React.FC<{
   certificate: Partial<CertificateOfEmployment>;
   settings: BusinessSettings;
 }> = ({ certificate, settings }) => {
-  const businessName = settings.business_name || 'Johnrois Stainless Steel Fabrication Shop';
+  const businessName = settings.business_name || 'Stainless Steel Fabrication';
   const startFormatted = formatFormalDate(certificate.start_date);
   const endFormatted = certificate.end_date
     ? formatFormalDate(certificate.end_date)
@@ -475,7 +478,9 @@ export const EmployeeIdCardFaces: React.FC<{
   card: Partial<EmployeeIdCard>;
   settings: BusinessSettings;
 }> = ({ card, settings }) => {
-  const businessName = settings.business_name || 'Johnrois Stainless Steel Fabrication Shop';
+  const businessName = settings.business_name || 'Stainless Steel Fabrication';
+  const [logoFailed, setLogoFailed] = useState(false);
+  const monogram = getBusinessMonogram(businessName);
 
   return (
     <div className="flex flex-wrap items-start justify-center gap-8">
@@ -488,15 +493,16 @@ export const EmployeeIdCardFaces: React.FC<{
           {/* Top Brand Header */}
           <div>
             <div className="bg-slate-900 text-white px-2.5 py-2 flex items-center gap-2 border-b-2 border-sky-600">
-              {settings.logo_url ? (
+              {settings.logo_url && !logoFailed ? (
                 <img
                   src={resolveAssetUrl(settings.logo_url)}
                   alt="Logo"
+                  onError={() => setLogoFailed(true)}
                   className="w-7 h-7 rounded-sm bg-white p-0.5 object-contain shrink-0"
                 />
               ) : (
-                <div className="w-7 h-7 rounded-sm bg-slate-800 border border-slate-600 flex items-center justify-center text-[9px] font-extrabold text-sky-400 shrink-0">
-                  JR
+                <div className="w-7 h-7 rounded-sm bg-slate-800 border border-slate-600 flex items-center justify-center text-[8px] font-extrabold text-sky-300 shrink-0">
+                  {monogram}
                 </div>
               )}
               <div className="min-w-0 leading-tight">

@@ -23,6 +23,7 @@ import {
   formatDate,
   formatPHP,
   generateIdempotencyKey,
+  getActiveBusinessSlug,
   resolveAssetUrl,
   todayYMD,
   uploadImageFile,
@@ -884,7 +885,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
             onClick={() =>
               downloadAuthenticatedFile(
                 '/api/backup/export-csv/employees',
-                `johnrois-employees-${todayYMD()}.csv`
+                `${getActiveBusinessSlug() || 'workspace'}-employees-${todayYMD()}.csv`
               ).catch((err) => setPageError(err.message))
             }
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"
