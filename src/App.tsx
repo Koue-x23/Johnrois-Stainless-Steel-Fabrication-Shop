@@ -17,6 +17,10 @@ import {
   ChevronDown,
   AlertTriangle,
   RefreshCw,
+  UserSquare2,
+  Banknote,
+  FileBadge,
+  IdCard,
 } from 'lucide-react';
 import { AuthUser, BusinessSettings, NavigationTarget, NavSection } from './types';
 import { apiFetch, formatPHP, resolveAssetUrl } from './lib/api';
@@ -29,10 +33,14 @@ import { CustomersPage } from './pages/CustomersPage';
 import { ProductsPage } from './pages/ProductsPage';
 import { PaymentsPage } from './pages/PaymentsPage';
 import { ReportsPage } from './pages/ReportsPage';
+import { EmployeesPage } from './pages/EmployeesPage';
+import { PayslipsPage } from './pages/PayslipsPage';
+import { CertificatesOfEmploymentPage } from './pages/CertificatesOfEmploymentPage';
+import { EmployeeIdsPage } from './pages/EmployeeIdsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { StatusBadge } from './components/StatusBadge';
 
-const NAV_ITEMS: {
+const MAIN_NAV_ITEMS: {
   id: NavSection;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
@@ -46,8 +54,26 @@ const NAV_ITEMS: {
   { id: 'products', label: 'Products and Services', icon: Package },
   { id: 'payments', label: 'Payments', icon: CreditCard },
   { id: 'reports', label: 'Reports', icon: BarChart3 },
-  { id: 'settings', label: 'Business Settings', icon: Settings },
 ];
+
+const HR_NAV_ITEMS: {
+  id: NavSection;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  { id: 'employees', label: 'Employee Directory', icon: UserSquare2 },
+  { id: 'payslips', label: 'Payslip Maker', icon: Banknote },
+  { id: 'certificates-of-employment', label: 'Certificate of Employment', icon: FileBadge },
+  { id: 'employee-ids', label: 'Employee ID Maker', icon: IdCard },
+];
+
+const SYSTEM_NAV_ITEMS: {
+  id: NavSection;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [{ id: 'settings', label: 'Business Settings', icon: Settings }];
+
+const NAV_ITEMS = [...MAIN_NAV_ITEMS, ...HR_NAV_ITEMS, ...SYSTEM_NAV_ITEMS];
 
 const VALID_SECTIONS = new Set<NavSection>(NAV_ITEMS.map((n) => n.id));
 
@@ -103,6 +129,10 @@ const DEFAULT_SETTINGS: BusinessSettings = {
   customer_prefix: 'CUST',
   product_prefix: 'ITEM',
   payment_prefix: 'PAY',
+  employee_prefix: 'EMP',
+  payslip_prefix: 'PSL',
+  coe_prefix: 'COE',
+  id_card_prefix: 'IDC',
   doc_number_padding: 4,
   include_year_in_doc_num: 1,
   default_payment_terms:
@@ -141,6 +171,7 @@ export const App: React.FC = () => {
     openId?: number;
     createNew?: boolean;
     prefillCustomerId?: number;
+    prefillEmployeeId?: number;
   }>({
     openId: initialTarget.openId,
     createNew: initialTarget.createNew,
@@ -214,6 +245,7 @@ export const App: React.FC = () => {
       openId: target.openId,
       createNew: target.createNew,
       prefillCustomerId: target.prefillCustomerId,
+      prefillEmployeeId: target.prefillEmployeeId,
     });
     setSidebarOpen(false);
     setQuickCreateOpen(false);
@@ -248,6 +280,14 @@ export const App: React.FC = () => {
         return 'billing-statements';
       case 'customer':
         return 'customers';
+      case 'employee':
+        return 'employees';
+      case 'payslip':
+        return 'payslips';
+      case 'coe':
+        return 'certificates-of-employment';
+      case 'employee_id':
+        return 'employee-ids';
       default:
         return 'dashboard';
     }
@@ -300,26 +340,75 @@ export const App: React.FC = () => {
           </button>
         </div>
 
-        <nav className="flex-1 px-2.5 py-4 space-y-0.5 overflow-y-auto">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const isActive = activeNav === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => navigateTo({ section: item.id })}
-                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded text-xs font-medium transition-colors ${
-                  isActive
-                    ? 'bg-sky-700 text-white font-semibold'
-                    : 'text-slate-300 hover:bg-slate-900 hover:text-white'
-                }`}
-              >
-                <Icon className="w-4 h-4 shrink-0" />
-                <span className="truncate">{item.label}</span>
-              </button>
-            );
-          })}
+        <nav className="flex-1 px-2.5 py-4 space-y-4 overflow-y-auto">
+          <div className="space-y-0.5">
+            {MAIN_NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeNav === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => navigateTo({ section: item.id })}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition-colors ${
+                    isActive
+                      ? 'bg-sky-700 text-white font-semibold'
+                      : 'text-slate-300 hover:bg-slate-900 hover:text-white'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="pt-2 border-t border-slate-800 space-y-0.5">
+            <div className="px-3 pb-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              HR &amp; Employee Documents
+            </div>
+            {HR_NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeNav === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => navigateTo({ section: item.id })}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition-colors ${
+                    isActive
+                      ? 'bg-sky-700 text-white font-semibold'
+                      : 'text-slate-300 hover:bg-slate-900 hover:text-white'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="pt-2 border-t border-slate-800 space-y-0.5">
+            {SYSTEM_NAV_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeNav === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => navigateTo({ section: item.id })}
+                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition-colors ${
+                    isActive
+                      ? 'bg-sky-700 text-white font-semibold'
+                      : 'text-slate-300 hover:bg-slate-900 hover:text-white'
+                  }`}
+                >
+                  <Icon className="w-4 h-4 shrink-0" />
+                  <span className="truncate">{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
         </nav>
 
         {settings.address && (
@@ -354,7 +443,7 @@ export const App: React.FC = () => {
                 onFocus={() => setSearchFocused(true)}
                 onBlur={() => setTimeout(() => setSearchFocused(false), 180)}
                 onChange={(e) => setGlobalQuery(e.target.value)}
-                placeholder="Global search: document #, customer, project, equipment..."
+                placeholder="Global search: document #, customer, employee, payslip, COE..."
                 className="w-full pl-9 pr-3 py-1.5 text-xs sm:text-sm bg-slate-50 border border-slate-300 rounded focus:bg-white focus:outline-none focus:ring-2 focus:ring-sky-600"
               />
 
@@ -458,6 +547,37 @@ export const App: React.FC = () => {
                 >
                   + New Customer
                 </button>
+                <div className="border-t border-slate-100 my-1" />
+                <button
+                  type="button"
+                  onClick={() => navigateTo({ section: 'employees', createNew: true })}
+                  className="w-full text-left px-3.5 py-2 hover:bg-slate-50 font-medium text-slate-800"
+                >
+                  + Add Employee
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateTo({ section: 'payslips', createNew: true })}
+                  className="w-full text-left px-3.5 py-2 hover:bg-slate-50 font-medium text-slate-800"
+                >
+                  + New Payslip
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    navigateTo({ section: 'certificates-of-employment', createNew: true })
+                  }
+                  className="w-full text-left px-3.5 py-2 hover:bg-slate-50 font-medium text-slate-800"
+                >
+                  + New COE
+                </button>
+                <button
+                  type="button"
+                  onClick={() => navigateTo({ section: 'employee-ids', createNew: true })}
+                  className="w-full text-left px-3.5 py-2 hover:bg-slate-50 font-medium text-slate-800"
+                >
+                  + New Employee ID
+                </button>
               </div>
             )}
           </div>
@@ -554,6 +674,45 @@ export const App: React.FC = () => {
           {activeNav === 'payments' && <PaymentsPage onNavigate={navigateTo} />}
 
           {activeNav === 'reports' && <ReportsPage onNavigate={navigateTo} />}
+
+          {activeNav === 'employees' && (
+            <EmployeesPage
+              initialOpenId={navPayload.openId}
+              initialCreateNew={navPayload.createNew}
+              onClearInitial={clearNavPayload}
+              onNavigate={navigateTo}
+            />
+          )}
+
+          {activeNav === 'payslips' && (
+            <PayslipsPage
+              settings={settings}
+              initialOpenId={navPayload.openId}
+              initialCreateNew={navPayload.createNew}
+              prefillEmployeeId={navPayload.prefillEmployeeId}
+              onClearInitial={clearNavPayload}
+            />
+          )}
+
+          {activeNav === 'certificates-of-employment' && (
+            <CertificatesOfEmploymentPage
+              settings={settings}
+              initialOpenId={navPayload.openId}
+              initialCreateNew={navPayload.createNew}
+              prefillEmployeeId={navPayload.prefillEmployeeId}
+              onClearInitial={clearNavPayload}
+            />
+          )}
+
+          {activeNav === 'employee-ids' && (
+            <EmployeeIdsPage
+              settings={settings}
+              initialOpenId={navPayload.openId}
+              initialCreateNew={navPayload.createNew}
+              prefillEmployeeId={navPayload.prefillEmployeeId}
+              onClearInitial={clearNavPayload}
+            />
+          )}
 
           {activeNav === 'settings' && (
             <SettingsPage settings={settings} onSettingsUpdated={(s) => setSettings(s)} />

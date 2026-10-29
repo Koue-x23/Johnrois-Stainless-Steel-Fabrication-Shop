@@ -36,6 +36,9 @@ import {
   generateInvoicePdf,
   generateServiceReportPdf,
   generateBillingStatementPdf,
+  generatePayslipPdf,
+  generateCoePdf,
+  generateEmployeeIdPdf,
 } from './pdfGenerator.js';
 
 const app = express();
@@ -439,6 +442,10 @@ app.put(
            customer_prefix = ?,
            product_prefix = ?,
            payment_prefix = ?,
+           employee_prefix = ?,
+           payslip_prefix = ?,
+           coe_prefix = ?,
+           id_card_prefix = ?,
            doc_number_padding = ?,
            include_year_in_doc_num = ?,
            default_payment_terms = ?,
@@ -470,6 +477,10 @@ app.put(
         String(b.customer_prefix || 'CUST').trim().toUpperCase(),
         String(b.product_prefix || 'ITEM').trim().toUpperCase(),
         String(b.payment_prefix || 'PAY').trim().toUpperCase(),
+        String(b.employee_prefix || 'EMP').trim().toUpperCase(),
+        String(b.payslip_prefix || 'PSL').trim().toUpperCase(),
+        String(b.coe_prefix || 'COE').trim().toUpperCase(),
+        String(b.id_card_prefix || 'IDC').trim().toUpperCase(),
         Math.max(3, Math.min(8, Number(b.doc_number_padding) || 4)),
         b.include_year_in_doc_num ? 1 : 0,
         String(b.default_payment_terms ?? '').trim(),
@@ -572,7 +583,7 @@ app.get(
     const recentCustomerActivity = await dbAll(`
       SELECT *
       FROM activity_logs
-      WHERE entity_type IN ('quotation', 'invoice', 'payment', 'service_report', 'billing_statement', 'customer')
+      WHERE entity_type IN ('quotation', 'invoice', 'payment', 'service_report', 'billing_statement', 'customer', 'employee', 'payslip', 'coe', 'employee_id')
       ORDER BY id DESC
       LIMIT 15
     `);
@@ -655,8 +666,50 @@ app.get(
       [like, like, like, like]
     );
 
+    const employees = await dbAll(
+      `SELECT 'employee' as type, id, full_name as title, employee_code || ' • ' || position_title as subtitle, CASE WHEN is_active = 1 THEN employment_status ELSE 'Inactive' END as status, NULL as amount
+       FROM employees
+       WHERE (full_name LIKE ? OR employee_code LIKE ? OR position_title LIKE ? OR department LIKE ?)
+       ORDER BY id DESC LIMIT 6`,
+      [like, like, like, like]
+    );
+
+    const payslips = await dbAll(
+      `SELECT 'payslip' as type, id, payslip_number as title, employee_name || ' (' || employee_code || ')' as subtitle, status, net_pay as amount
+       FROM payslips
+       WHERE is_archived = 0 AND (payslip_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
+       ORDER BY id DESC LIMIT 6`,
+      [like, like, like]
+    );
+
+    const coes = await dbAll(
+      `SELECT 'coe' as type, id, certificate_number as title, employee_name || ' • ' || position_title as subtitle, 'Issued' as status, NULL as amount
+       FROM certificates_of_employment
+       WHERE is_archived = 0 AND (certificate_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ?)
+       ORDER BY id DESC LIMIT 6`,
+      [like, like, like]
+    );
+
+    const idCards = await dbAll(
+      `SELECT 'employee_id' as type, id, employee_code as title, full_name || ' • ' || card_number as subtitle, status, NULL as amount
+       FROM employee_id_cards
+       WHERE is_archived = 0 AND (employee_code LIKE ? OR full_name LIKE ? OR card_number LIKE ?)
+       ORDER BY id DESC LIMIT 6`,
+      [like, like, like]
+    );
+
     res.json({
-      results: [...quotes, ...invoices, ...reports, ...statements, ...customers],
+      results: [
+        ...quotes,
+        ...invoices,
+        ...reports,
+        ...statements,
+        ...customers,
+        ...employees,
+        ...payslips,
+        ...coes,
+        ...idCards,
+      ],
     });
   })
 );
@@ -2951,6 +3004,1560 @@ app.get(
 );
 
 // ============================================================================
+// HR & EMPLOYEE DOCUMENTS — 1. EMPLOYEE DIRECTORY
+// ============================================================================
+
+app.get(
+  '/api/employees/next-code',
+  asyncHandler(async (_req, res) => {
+    res.json({ next_code: await previewNextDocNumber('employee') });
+  })
+);
+
+app.get(
+  '/api/employees',
+  asyncHandler(async (req, res) => {
+    const search = String(req.query.search || '').trim();
+    const status = String(req.query.status || 'active');
+
+    let where = 'WHERE 1=1';
+    const params = [];
+    if (status === 'active') where += ' AND e.is_active = 1';
+    else if (status === 'inactive') where += ' AND e.is_active = 0';
+
+    if (search) {
+      where +=
+        ' AND (e.employee_code LIKE ? OR e.full_name LIKE ? OR e.position_title LIKE ? OR e.department LIKE ? OR e.contact_number LIKE ?)';
+      const lk = `%${search}%`;
+      params.push(lk, lk, lk, lk, lk);
+    }
+
+    const employees = await dbAll(
+      `SELECT e.*,
+        (SELECT COUNT(*) FROM payslips p WHERE p.employee_id = e.id AND p.is_archived = 0) as payslip_count,
+        (SELECT COUNT(*) FROM certificates_of_employment c WHERE c.employee_id = e.id AND c.is_archived = 0) as coe_count,
+        (SELECT COUNT(*) FROM employee_id_cards ic WHERE ic.employee_id = e.id AND ic.is_archived = 0) as id_card_count
+       FROM employees e
+       ${where}
+       ORDER BY e.full_name ASC, e.id DESC`,
+      params
+    );
+
+    res.json({ employees });
+  })
+);
+
+app.get(
+  '/api/employees/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const employee = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    if (!employee) return res.status(404).json({ error: 'Employee record not found.' });
+
+    const payslips = await dbAll(
+      `SELECT id, payslip_number, pay_period_start, pay_period_end, payment_date, total_earnings, total_deductions, net_pay, status, created_at
+       FROM payslips WHERE employee_id = ? AND is_archived = 0 ORDER BY payment_date DESC, id DESC`,
+      [id]
+    );
+
+    const certificates = await dbAll(
+      `SELECT id, certificate_number, date_issued, position_title, employment_status, include_salary, created_at
+       FROM certificates_of_employment WHERE employee_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
+      [id]
+    );
+
+    const id_cards = await dbAll(
+      `SELECT id, card_number, employee_code, date_issued, expiration_date, status, created_at
+       FROM employee_id_cards WHERE employee_id = ? AND is_archived = 0 ORDER BY date_issued DESC, id DESC`,
+      [id]
+    );
+
+    res.json({
+      employee,
+      history: {
+        payslips,
+        certificates,
+        id_cards,
+      },
+    });
+  })
+);
+
+app.post(
+  '/api/employees',
+  asyncHandler(async (req, res) => {
+    const idemHit = await getIdempotencyHit(req, 'employee');
+    if (idemHit) {
+      const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [idemHit]);
+      if (existing) return res.json({ employee: existing });
+    }
+
+    const b = req.body || {};
+    const fullName = String(b.full_name || '').trim();
+    const positionTitle = String(b.position_title || '').trim();
+    if (!fullName) {
+      return res.status(400).json({ error: 'Employee full name is required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Position or job title is required.' });
+    }
+
+    const startDate = String(b.start_date || '').trim();
+    const endDate = String(b.end_date || '').trim();
+    if (startDate && endDate && startDate > endDate) {
+      return res
+        .status(400)
+        .json({ error: 'Employment end date cannot be earlier than start date.' });
+    }
+
+    const requestedCode = String(b.employee_code || '').trim();
+    if (requestedCode) {
+      const dup = await dbGet(
+        'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+        [requestedCode]
+      );
+      if (dup) {
+        return res.status(409).json({
+          error: `Employee ID "${dup.employee_code}" is already assigned to ${dup.full_name}. Please use a unique Employee ID.`,
+        });
+      }
+    }
+
+    const validBasis = ['daily', 'semi_monthly', 'monthly', 'hourly'].includes(b.pay_basis)
+      ? b.pay_basis
+      : 'daily';
+
+    const created = await runInTransaction(async () => {
+      const code = requestedCode || (await allocateNextDocNumber('employee'));
+      const dupCheck = await dbGet(
+        'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+        [code]
+      );
+      if (dupCheck) {
+        const err = new Error(
+          `Employee ID "${dupCheck.employee_code}" is already assigned to ${dupCheck.full_name}.`
+        );
+        err.status = 409;
+        throw err;
+      }
+
+      const now = nowISO();
+      const info = await dbRun(
+        `INSERT INTO employees (
+          employee_code, full_name, position_title, department, employment_type, employment_status,
+          start_date, end_date, contact_number, email, address,
+          emergency_contact_name, emergency_contact_number,
+          pay_basis, default_rate, photo_url, notes, is_active, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+        [
+          code,
+          fullName,
+          positionTitle,
+          String(b.department || '').trim(),
+          String(b.employment_type || 'Regular').trim(),
+          String(b.employment_status || 'Active').trim(),
+          startDate,
+          endDate,
+          String(b.contact_number || '').trim(),
+          String(b.email || '').trim(),
+          String(b.address || '').trim(),
+          String(b.emergency_contact_name || '').trim(),
+          String(b.emergency_contact_number || '').trim(),
+          validBasis,
+          Math.max(0, round2(b.default_rate)),
+          String(b.photo_url || '').trim(),
+          String(b.notes || '').trim(),
+          now,
+          now,
+        ]
+      );
+      const id = Number(info.lastInsertRowid);
+      await saveIdempotencyKey(req, 'employee', id);
+      await logActivity({
+        entity_type: 'employee',
+        entity_id: id,
+        document_number: code,
+        customer_name: fullName,
+        action: 'created',
+        summary: `Added employee ${fullName} (${code}) — ${positionTitle}`,
+        actor_name: req.user.full_name,
+      });
+      return dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    });
+
+    res.status(201).json({ employee: created });
+  })
+);
+
+app.put(
+  '/api/employees/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
+
+    const b = req.body || {};
+    const fullName = String(b.full_name || '').trim();
+    const positionTitle = String(b.position_title || '').trim();
+    const employeeCode = String(b.employee_code || existing.employee_code).trim();
+
+    if (!employeeCode) {
+      return res.status(400).json({ error: 'Employee ID is required.' });
+    }
+    if (!fullName) {
+      return res.status(400).json({ error: 'Employee full name is required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Position or job title is required.' });
+    }
+
+    const startDate = String(b.start_date ?? existing.start_date).trim();
+    const endDate = String(b.end_date ?? existing.end_date).trim();
+    if (startDate && endDate && startDate > endDate) {
+      return res
+        .status(400)
+        .json({ error: 'Employment end date cannot be earlier than start date.' });
+    }
+
+    const dup = await dbGet(
+      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?)) AND id != ?',
+      [employeeCode, id]
+    );
+    if (dup) {
+      return res.status(409).json({
+        error: `Employee ID "${dup.employee_code}" is already assigned to ${dup.full_name}.`,
+      });
+    }
+
+    const validBasis = ['daily', 'semi_monthly', 'monthly', 'hourly'].includes(b.pay_basis)
+      ? b.pay_basis
+      : existing.pay_basis || 'daily';
+
+    // Historical payslips, COEs, and ID cards store snapshotted fields and remain untouched
+    await dbRun(
+      `UPDATE employees
+       SET employee_code = ?,
+           full_name = ?,
+           position_title = ?,
+           department = ?,
+           employment_type = ?,
+           employment_status = ?,
+           start_date = ?,
+           end_date = ?,
+           contact_number = ?,
+           email = ?,
+           address = ?,
+           emergency_contact_name = ?,
+           emergency_contact_number = ?,
+           pay_basis = ?,
+           default_rate = ?,
+           photo_url = ?,
+           notes = ?,
+           is_active = ?,
+           updated_at = ?
+       WHERE id = ?`,
+      [
+        employeeCode,
+        fullName,
+        positionTitle,
+        String(b.department ?? existing.department).trim(),
+        String(b.employment_type ?? existing.employment_type).trim(),
+        String(b.employment_status ?? existing.employment_status).trim(),
+        startDate,
+        endDate,
+        String(b.contact_number ?? existing.contact_number).trim(),
+        String(b.email ?? existing.email).trim(),
+        String(b.address ?? existing.address).trim(),
+        String(b.emergency_contact_name ?? existing.emergency_contact_name).trim(),
+        String(b.emergency_contact_number ?? existing.emergency_contact_number).trim(),
+        validBasis,
+        b.default_rate !== undefined ? Math.max(0, round2(b.default_rate)) : existing.default_rate,
+        String(b.photo_url ?? existing.photo_url).trim(),
+        String(b.notes ?? existing.notes).trim(),
+        b.is_active !== undefined ? (b.is_active ? 1 : 0) : existing.is_active,
+        nowISO(),
+        id,
+      ]
+    );
+
+    const updated = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    res.json({ employee: updated });
+  })
+);
+
+app.patch(
+  '/api/employees/:id/status',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
+
+    const isActive = req.body?.is_active ? 1 : 0;
+    const nextEmploymentStatus =
+      req.body?.employment_status ||
+      (isActive ? (existing.employment_status === 'Inactive' ? 'Active' : existing.employment_status) : 'Inactive');
+
+    await dbRun(
+      'UPDATE employees SET is_active = ?, employment_status = ?, updated_at = ? WHERE id = ?',
+      [isActive, String(nextEmploymentStatus).trim(), nowISO(), id]
+    );
+
+    await logActivity({
+      entity_type: 'employee',
+      entity_id: id,
+      document_number: existing.employee_code,
+      customer_name: existing.full_name,
+      action: isActive ? 'reactivated' : 'deactivated',
+      summary: `${isActive ? 'Reactivated' : 'Deactivated'} employee ${existing.full_name} (${existing.employee_code})`,
+      actor_name: req.user.full_name,
+    });
+
+    res.json({ employee: await dbGet('SELECT * FROM employees WHERE id = ?', [id]) });
+  })
+);
+
+app.delete(
+  '/api/employees/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM employees WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Employee record not found.' });
+
+    const refs = await dbGet(
+      `SELECT
+        (SELECT COUNT(*) FROM payslips WHERE employee_id = ? AND is_archived = 0) as payslips,
+        (SELECT COUNT(*) FROM certificates_of_employment WHERE employee_id = ? AND is_archived = 0) as coes,
+        (SELECT COUNT(*) FROM employee_id_cards WHERE employee_id = ? AND is_archived = 0) as ids`,
+      [id, id, id]
+    );
+    const totalRefs =
+      Number(refs?.payslips || 0) + Number(refs?.coes || 0) + Number(refs?.ids || 0);
+
+    if (totalRefs > 0) {
+      return res.status(409).json({
+        error: `Cannot delete "${existing.full_name}" while they have ${totalRefs} saved HR document(s). Deactivate this employee instead to preserve historical payroll and HR records.`,
+      });
+    }
+
+    await dbRun('DELETE FROM employees WHERE id = ?', [id]);
+    res.json({ ok: true });
+  })
+);
+
+// ============================================================================
+// HR & EMPLOYEE DOCUMENTS — 2. PAYSLIP MAKER
+// ============================================================================
+
+function computePayslipBreakdown(b) {
+  const payBasis = ['daily', 'semi_monthly', 'monthly', 'hourly'].includes(b.pay_basis)
+    ? b.pay_basis
+    : 'daily';
+  const baseRate = Math.max(0, round2(b.base_rate));
+  const daysWorked = Math.max(0, Number(b.days_worked) || 0);
+  const hoursWorked = Math.max(0, Number(b.hours_worked) || 0);
+
+  let regularPay = 0;
+  if (payBasis === 'daily') {
+    regularPay = round2(baseRate * daysWorked);
+  } else if (payBasis === 'hourly') {
+    regularPay = round2(baseRate * hoursWorked);
+  } else if (payBasis === 'semi_monthly') {
+    regularPay = round2(baseRate / 2);
+  } else if (payBasis === 'monthly') {
+    regularPay = round2(baseRate);
+  }
+
+  const overtimeHours = Math.max(0, Number(b.overtime_hours) || 0);
+  const overtimeRate = Math.max(0, round2(b.overtime_rate));
+  const overtimePay =
+    overtimeHours > 0 && overtimeRate > 0
+      ? round2(overtimeHours * overtimeRate)
+      : Math.max(0, round2(b.overtime_pay));
+
+  const allowances = Math.max(0, round2(b.allowances));
+  const bonuses = Math.max(0, round2(b.bonuses));
+  const otherEarnings = Math.max(0, round2(b.other_earnings));
+
+  const sssDeduction = Math.max(0, round2(b.sss_deduction));
+  const philhealthDeduction = Math.max(0, round2(b.philhealth_deduction));
+  const pagibigDeduction = Math.max(0, round2(b.pagibig_deduction));
+  const withholdingTax = Math.max(0, round2(b.withholding_tax));
+  const cashAdvance = Math.max(0, round2(b.cash_advance));
+  const otherDeductions = Math.max(0, round2(b.other_deductions));
+
+  const totalEarnings = round2(regularPay + overtimePay + allowances + bonuses + otherEarnings);
+  const totalDeductions = round2(
+    sssDeduction +
+      philhealthDeduction +
+      pagibigDeduction +
+      withholdingTax +
+      cashAdvance +
+      otherDeductions
+  );
+  const netPay = round2(totalEarnings - totalDeductions);
+
+  return {
+    pay_basis: payBasis,
+    base_rate: baseRate,
+    days_worked: daysWorked,
+    hours_worked: hoursWorked,
+    regular_pay: regularPay,
+    overtime_hours: overtimeHours,
+    overtime_rate: overtimeRate,
+    overtime_pay: overtimePay,
+    allowances,
+    bonuses,
+    other_earnings: otherEarnings,
+    sss_deduction: sssDeduction,
+    philhealth_deduction: philhealthDeduction,
+    pagibig_deduction: pagibigDeduction,
+    withholding_tax: withholdingTax,
+    cash_advance: cashAdvance,
+    other_deductions: otherDeductions,
+    total_earnings: totalEarnings,
+    total_deductions: totalDeductions,
+    net_pay: netPay,
+  };
+}
+
+app.get(
+  '/api/payslips/next-number',
+  asyncHandler(async (req, res) => {
+    const dateStr = String(req.query.date || todayYMD());
+    res.json({ next_number: await previewNextDocNumber('payslip', dateStr) });
+  })
+);
+
+app.get(
+  '/api/payslips',
+  asyncHandler(async (req, res) => {
+    const search = String(req.query.search || '').trim();
+    const status = String(req.query.status || 'all');
+    const employeeId = Number(req.query.employee_id || 0);
+    const dateFrom = String(req.query.date_from || '');
+    const dateTo = String(req.query.date_to || '');
+
+    let where = 'WHERE is_archived = 0';
+    const params = [];
+    if (status && status !== 'all') {
+      where += ' AND status = ?';
+      params.push(status);
+    }
+    if (employeeId > 0) {
+      where += ' AND employee_id = ?';
+      params.push(employeeId);
+    }
+    if (dateFrom) {
+      where += ' AND payment_date >= ?';
+      params.push(dateFrom);
+    }
+    if (dateTo) {
+      where += ' AND payment_date <= ?';
+      params.push(dateTo);
+    }
+    if (search) {
+      where +=
+        ' AND (payslip_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ? OR position_title LIKE ?)';
+      const lk = `%${search}%`;
+      params.push(lk, lk, lk, lk);
+    }
+
+    const payslips = await dbAll(
+      `SELECT * FROM payslips ${where} ORDER BY payment_date DESC, id DESC`,
+      params
+    );
+    res.json({ payslips });
+  })
+);
+
+app.get(
+  '/api/payslips/:id',
+  asyncHandler(async (req, res) => {
+    const payslip = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
+      Number(req.params.id),
+    ]);
+    if (!payslip) return res.status(404).json({ error: 'Payslip not found.' });
+    res.json({ payslip });
+  })
+);
+
+app.post(
+  '/api/payslips',
+  asyncHandler(async (req, res) => {
+    const idemHit = await getIdempotencyHit(req, 'payslip');
+    if (idemHit) {
+      const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
+        idemHit,
+      ]);
+      if (existing) return res.json({ payslip: existing });
+    }
+
+    const b = req.body || {};
+    const employeeId = b.employee_id ? Number(b.employee_id) : null;
+    const empRow = employeeId
+      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      : null;
+
+    const employeeName = String(b.employee_name || empRow?.full_name || '').trim();
+    const employeeCode = String(b.employee_code || empRow?.employee_code || '').trim();
+    const positionTitle = String(b.position_title ?? empRow?.position_title ?? '').trim();
+    const department = String(b.department ?? empRow?.department ?? '').trim();
+    const periodStart = String(b.pay_period_start || '').trim();
+    const periodEnd = String(b.pay_period_end || '').trim();
+    const paymentDate = String(b.payment_date || '').trim();
+
+    if (!employeeName || !employeeCode) {
+      return res.status(400).json({ error: 'Employee name and Employee ID are required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Employee position or job title is required.' });
+    }
+    if (!periodStart || !periodEnd || !paymentDate) {
+      return res
+        .status(400)
+        .json({ error: 'Pay period start, pay period end, and payment date are required.' });
+    }
+    if (periodStart > periodEnd) {
+      return res
+        .status(400)
+        .json({ error: 'Pay period start date must be on or before pay period end date.' });
+    }
+
+    const calc = computePayslipBreakdown(b);
+    if (calc.pay_basis === 'daily' && calc.base_rate > 0 && calc.days_worked <= 0 && calc.total_earnings <= 0) {
+      return res.status(400).json({ error: 'Please enter days worked for a Daily Rate payslip.' });
+    }
+    if (calc.pay_basis === 'hourly' && calc.base_rate > 0 && calc.hours_worked <= 0 && calc.total_earnings <= 0) {
+      return res.status(400).json({ error: 'Please enter hours worked for an Hourly Rate payslip.' });
+    }
+    if (calc.total_earnings <= 0) {
+      return res.status(400).json({ error: 'Total earnings must be greater than ₱0.00.' });
+    }
+    if (calc.net_pay < 0) {
+      return res.status(400).json({
+        error: `Total deductions (₱${calc.total_deductions.toFixed(
+          2
+        )}) exceed total earnings (₱${calc.total_earnings.toFixed(2)}).`,
+      });
+    }
+
+    // Prevent accidental duplicate payslips for the same employee and pay period
+    const dup = employeeId
+      ? await dbGet(
+          `SELECT id, payslip_number FROM payslips
+           WHERE is_archived = 0
+             AND (employee_id = ? OR LOWER(TRIM(employee_code)) = LOWER(TRIM(?)))
+             AND pay_period_start = ?
+             AND pay_period_end = ?
+           LIMIT 1`,
+          [employeeId, employeeCode, periodStart, periodEnd]
+        )
+      : await dbGet(
+          `SELECT id, payslip_number FROM payslips
+           WHERE is_archived = 0
+             AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
+             AND pay_period_start = ?
+             AND pay_period_end = ?
+           LIMIT 1`,
+          [employeeCode, periodStart, periodEnd]
+        );
+
+    if (dup) {
+      return res.status(409).json({
+        error: `Duplicate payslip prevented: ${dup.payslip_number} already exists for ${employeeName} (${employeeCode}) covering ${periodStart} to ${periodEnd}.`,
+      });
+    }
+
+    const validStatus = ['Draft', 'Issued', 'Paid'].includes(b.status) ? b.status : 'Issued';
+
+    const createdId = await runInTransaction(async () => {
+      const pslNumber = await allocateNextDocNumber('payslip', paymentDate);
+      const settings = await getSettings();
+      const now = nowISO();
+
+      const info = await dbRun(
+        `INSERT INTO payslips (
+          payslip_number, employee_id, employee_code, employee_name, position_title, department,
+          pay_period_start, pay_period_end, payment_date,
+          pay_basis, base_rate, days_worked, hours_worked, regular_pay,
+          overtime_hours, overtime_rate, overtime_pay,
+          allowances, bonuses, other_earnings, other_earnings_note,
+          sss_deduction, philhealth_deduction, pagibig_deduction, withholding_tax, cash_advance, other_deductions, other_deductions_note,
+          total_earnings, total_deductions, net_pay,
+          payment_method, remarks, prepared_by, approved_by, employee_signature_url,
+          status, is_archived, created_at, updated_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, 0, ?, ?
+        )`,
+        [
+          pslNumber,
+          empRow ? empRow.id : null,
+          employeeCode,
+          employeeName,
+          positionTitle,
+          department,
+          periodStart,
+          periodEnd,
+          paymentDate,
+          calc.pay_basis,
+          calc.base_rate,
+          calc.days_worked,
+          calc.hours_worked,
+          calc.regular_pay,
+          calc.overtime_hours,
+          calc.overtime_rate,
+          calc.overtime_pay,
+          calc.allowances,
+          calc.bonuses,
+          calc.other_earnings,
+          String(b.other_earnings_note || '').trim(),
+          calc.sss_deduction,
+          calc.philhealth_deduction,
+          calc.pagibig_deduction,
+          calc.withholding_tax,
+          calc.cash_advance,
+          calc.other_deductions,
+          String(b.other_deductions_note || '').trim(),
+          calc.total_earnings,
+          calc.total_deductions,
+          calc.net_pay,
+          String(b.payment_method || 'Cash').trim(),
+          String(b.remarks || '').trim(),
+          String(b.prepared_by ?? req.user.full_name ?? '').trim(),
+          String(b.approved_by ?? settings.authorized_representative ?? '').trim(),
+          String(b.employee_signature_url || '').trim(),
+          validStatus,
+          now,
+          now,
+        ]
+      );
+
+      const newId = Number(info.lastInsertRowid);
+      await saveIdempotencyKey(req, 'payslip', newId);
+      await logActivity({
+        entity_type: 'payslip',
+        entity_id: newId,
+        document_number: pslNumber,
+        customer_name: employeeName,
+        action: 'created',
+        summary: `Issued payslip ${pslNumber} for ${employeeName} (${periodStart} to ${periodEnd})`,
+        amount: calc.net_pay,
+        actor_name: req.user.full_name,
+      });
+      return newId;
+    });
+
+    res.status(201).json({
+      payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [createdId]),
+    });
+  })
+);
+
+app.put(
+  '/api/payslips/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
+
+    const b = req.body || {};
+    const employeeId =
+      b.employee_id !== undefined
+        ? b.employee_id
+          ? Number(b.employee_id)
+          : null
+        : existing.employee_id;
+    const employeeName = String(b.employee_name ?? existing.employee_name).trim();
+    const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
+    const positionTitle = String(b.position_title ?? existing.position_title).trim();
+    const department = String(b.department ?? existing.department).trim();
+    const periodStart = String(b.pay_period_start || existing.pay_period_start).trim();
+    const periodEnd = String(b.pay_period_end || existing.pay_period_end).trim();
+    const paymentDate = String(b.payment_date || existing.payment_date).trim();
+
+    if (!employeeName || !employeeCode) {
+      return res.status(400).json({ error: 'Employee name and Employee ID are required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Employee position or job title is required.' });
+    }
+    if (periodStart > periodEnd) {
+      return res
+        .status(400)
+        .json({ error: 'Pay period start date must be on or before pay period end date.' });
+    }
+
+    const calc = computePayslipBreakdown(b);
+    if (calc.total_earnings <= 0) {
+      return res.status(400).json({ error: 'Total earnings must be greater than ₱0.00.' });
+    }
+    if (calc.net_pay < 0) {
+      return res.status(400).json({
+        error: `Total deductions (₱${calc.total_deductions.toFixed(
+          2
+        )}) exceed total earnings (₱${calc.total_earnings.toFixed(2)}).`,
+      });
+    }
+
+    const dup = employeeId
+      ? await dbGet(
+          `SELECT id, payslip_number FROM payslips
+           WHERE is_archived = 0
+             AND id != ?
+             AND (employee_id = ? OR LOWER(TRIM(employee_code)) = LOWER(TRIM(?)))
+             AND pay_period_start = ?
+             AND pay_period_end = ?
+           LIMIT 1`,
+          [id, employeeId, employeeCode, periodStart, periodEnd]
+        )
+      : await dbGet(
+          `SELECT id, payslip_number FROM payslips
+           WHERE is_archived = 0
+             AND id != ?
+             AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
+             AND pay_period_start = ?
+             AND pay_period_end = ?
+           LIMIT 1`,
+          [id, employeeCode, periodStart, periodEnd]
+        );
+
+    if (dup) {
+      return res.status(409).json({
+        error: `Duplicate payslip prevented: ${dup.payslip_number} already exists for ${employeeName} (${employeeCode}) covering ${periodStart} to ${periodEnd}.`,
+      });
+    }
+
+    const validStatus = ['Draft', 'Issued', 'Paid'].includes(b.status) ? b.status : existing.status;
+
+    await dbRun(
+      `UPDATE payslips
+       SET employee_id = ?, employee_code = ?, employee_name = ?, position_title = ?, department = ?,
+           pay_period_start = ?, pay_period_end = ?, payment_date = ?,
+           pay_basis = ?, base_rate = ?, days_worked = ?, hours_worked = ?, regular_pay = ?,
+           overtime_hours = ?, overtime_rate = ?, overtime_pay = ?,
+           allowances = ?, bonuses = ?, other_earnings = ?, other_earnings_note = ?,
+           sss_deduction = ?, philhealth_deduction = ?, pagibig_deduction = ?, withholding_tax = ?, cash_advance = ?, other_deductions = ?, other_deductions_note = ?,
+           total_earnings = ?, total_deductions = ?, net_pay = ?,
+           payment_method = ?, remarks = ?, prepared_by = ?, approved_by = ?, employee_signature_url = ?,
+           status = ?, updated_at = ?
+       WHERE id = ?`,
+      [
+        employeeId,
+        employeeCode,
+        employeeName,
+        positionTitle,
+        department,
+        periodStart,
+        periodEnd,
+        paymentDate,
+        calc.pay_basis,
+        calc.base_rate,
+        calc.days_worked,
+        calc.hours_worked,
+        calc.regular_pay,
+        calc.overtime_hours,
+        calc.overtime_rate,
+        calc.overtime_pay,
+        calc.allowances,
+        calc.bonuses,
+        calc.other_earnings,
+        String(b.other_earnings_note ?? existing.other_earnings_note).trim(),
+        calc.sss_deduction,
+        calc.philhealth_deduction,
+        calc.pagibig_deduction,
+        calc.withholding_tax,
+        calc.cash_advance,
+        calc.other_deductions,
+        String(b.other_deductions_note ?? existing.other_deductions_note).trim(),
+        calc.total_earnings,
+        calc.total_deductions,
+        calc.net_pay,
+        String(b.payment_method ?? existing.payment_method).trim(),
+        String(b.remarks ?? existing.remarks).trim(),
+        String(b.prepared_by ?? existing.prepared_by).trim(),
+        String(b.approved_by ?? existing.approved_by).trim(),
+        String(b.employee_signature_url ?? existing.employee_signature_url).trim(),
+        validStatus,
+        nowISO(),
+        id,
+      ]
+    );
+
+    res.json({ payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [id]) });
+  })
+);
+
+app.patch(
+  '/api/payslips/:id/status',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
+    const status = String(req.body?.status || '');
+    if (!['Draft', 'Issued', 'Paid'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid payslip status.' });
+    }
+    await dbRun('UPDATE payslips SET status = ?, updated_at = ? WHERE id = ?', [
+      status,
+      nowISO(),
+      id,
+    ]);
+    res.json({ payslip: await dbGet('SELECT * FROM payslips WHERE id = ?', [id]) });
+  })
+);
+
+app.delete(
+  '/api/payslips/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [id]);
+    if (!existing) return res.status(404).json({ error: 'Payslip not found.' });
+    await dbRun('UPDATE payslips SET is_archived = 1, updated_at = ? WHERE id = ?', [nowISO(), id]);
+    res.json({ ok: true });
+  })
+);
+
+app.get(
+  '/api/payslips/:id/pdf',
+  asyncHandler(async (req, res) => {
+    const payslip = await dbGet('SELECT * FROM payslips WHERE id = ? AND is_archived = 0', [
+      Number(req.params.id),
+    ]);
+    if (!payslip) return res.status(404).json({ error: 'Payslip not found.' });
+    const settings = await getSettings();
+    const pdfBuf = await generatePayslipPdf(payslip, settings);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${payslip.payslip_number}.pdf"`);
+    res.send(pdfBuf);
+  })
+);
+
+// ============================================================================
+// HR & EMPLOYEE DOCUMENTS — 3. CERTIFICATE OF EMPLOYMENT (COE) MAKER
+// ============================================================================
+
+app.get(
+  '/api/certificates-of-employment/next-number',
+  asyncHandler(async (req, res) => {
+    const dateStr = String(req.query.date || todayYMD());
+    res.json({ next_number: await previewNextDocNumber('coe', dateStr) });
+  })
+);
+
+app.get(
+  '/api/certificates-of-employment',
+  asyncHandler(async (req, res) => {
+    const search = String(req.query.search || '').trim();
+    const employeeId = Number(req.query.employee_id || 0);
+
+    let where = 'WHERE is_archived = 0';
+    const params = [];
+    if (employeeId > 0) {
+      where += ' AND employee_id = ?';
+      params.push(employeeId);
+    }
+    if (search) {
+      where +=
+        ' AND (certificate_number LIKE ? OR employee_name LIKE ? OR employee_code LIKE ? OR position_title LIKE ? OR purpose LIKE ?)';
+      const lk = `%${search}%`;
+      params.push(lk, lk, lk, lk, lk);
+    }
+
+    const certificates = await dbAll(
+      `SELECT * FROM certificates_of_employment ${where} ORDER BY date_issued DESC, id DESC`,
+      params
+    );
+    res.json({ certificates });
+  })
+);
+
+app.get(
+  '/api/certificates-of-employment/:id',
+  asyncHandler(async (req, res) => {
+    const certificate = await dbGet(
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
+      [Number(req.params.id)]
+    );
+    if (!certificate) return res.status(404).json({ error: 'Certificate of Employment not found.' });
+    res.json({ certificate });
+  })
+);
+
+app.post(
+  '/api/certificates-of-employment',
+  asyncHandler(async (req, res) => {
+    const idemHit = await getIdempotencyHit(req, 'coe');
+    if (idemHit) {
+      const existing = await dbGet(
+        'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
+        [idemHit]
+      );
+      if (existing) return res.json({ certificate: existing });
+    }
+
+    const b = req.body || {};
+    const employeeId = b.employee_id ? Number(b.employee_id) : null;
+    const empRow = employeeId
+      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      : null;
+
+    const employeeName = String(b.employee_name || empRow?.full_name || '').trim();
+    const employeeCode = String(b.employee_code ?? empRow?.employee_code ?? '').trim();
+    const positionTitle = String(b.position_title || empRow?.position_title || '').trim();
+    const department = String(b.department ?? empRow?.department ?? '').trim();
+    const employmentType = String(b.employment_type ?? empRow?.employment_type ?? '').trim();
+    const employmentStatus = String(b.employment_status || empRow?.employment_status || '').trim();
+    const startDate = String(b.start_date || empRow?.start_date || '').trim();
+    const endDate = String(b.end_date ?? empRow?.end_date ?? '').trim();
+    const dateIssued = String(b.date_issued || '').trim();
+    const includeSalary = b.include_salary ? 1 : 0;
+    const salaryAmount = includeSalary ? Math.max(0, round2(b.salary_amount)) : 0;
+    const salaryPeriod = String(b.salary_period || 'monthly').trim();
+
+    if (!employeeName) {
+      return res.status(400).json({ error: 'Employee full name is required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Job title or position is required.' });
+    }
+    if (!employmentStatus) {
+      return res.status(400).json({ error: 'Employment status is required.' });
+    }
+    if (!startDate) {
+      return res
+        .status(400)
+        .json({ error: 'Verified employment start date is required before issuing a COE.' });
+    }
+    if (endDate && startDate > endDate) {
+      return res
+        .status(400)
+        .json({ error: 'Employment end date cannot be earlier than start date.' });
+    }
+    if (!dateIssued) {
+      return res.status(400).json({ error: 'Date of issuance is required.' });
+    }
+    if (includeSalary && salaryAmount <= 0) {
+      return res.status(400).json({
+        error:
+          'Please enter the verified compensation amount when "Include Salary Details" is enabled, or turn off salary inclusion.',
+      });
+    }
+
+    const createdId = await runInTransaction(async () => {
+      const certNum = await allocateNextDocNumber('coe', dateIssued);
+      const settings = await getSettings();
+      const now = nowISO();
+
+      const info = await dbRun(
+        `INSERT INTO certificates_of_employment (
+          certificate_number, employee_id, employee_code, employee_name, position_title, department,
+          employment_type, employment_status, start_date, end_date, date_issued, purpose,
+          include_salary, salary_amount, salary_period, custom_body,
+          signatory_name, signatory_title, signature_url, remarks,
+          is_archived, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        [
+          certNum,
+          empRow ? empRow.id : null,
+          employeeCode,
+          employeeName,
+          positionTitle,
+          department,
+          employmentType,
+          employmentStatus,
+          startDate,
+          endDate,
+          dateIssued,
+          String(b.purpose || '').trim(),
+          includeSalary,
+          salaryAmount,
+          salaryPeriod,
+          String(b.custom_body || '').trim(),
+          String(b.signatory_name ?? settings.authorized_representative ?? '').trim(),
+          String(b.signatory_title ?? settings.authorized_title ?? 'Authorized Representative').trim(),
+          String(b.signature_url ?? settings.signature_url ?? '').trim(),
+          String(b.remarks || '').trim(),
+          now,
+          now,
+        ]
+      );
+
+      const newId = Number(info.lastInsertRowid);
+      await saveIdempotencyKey(req, 'coe', newId);
+      await logActivity({
+        entity_type: 'coe',
+        entity_id: newId,
+        document_number: certNum,
+        customer_name: employeeName,
+        action: 'created',
+        summary: `Issued Certificate of Employment ${certNum} for ${employeeName}`,
+        actor_name: req.user.full_name,
+      });
+      return newId;
+    });
+
+    res.status(201).json({
+      certificate: await dbGet('SELECT * FROM certificates_of_employment WHERE id = ?', [
+        createdId,
+      ]),
+    });
+  })
+);
+
+app.put(
+  '/api/certificates-of-employment/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet(
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
+      [id]
+    );
+    if (!existing) return res.status(404).json({ error: 'Certificate of Employment not found.' });
+
+    const b = req.body || {};
+    const employeeId =
+      b.employee_id !== undefined
+        ? b.employee_id
+          ? Number(b.employee_id)
+          : null
+        : existing.employee_id;
+    const employeeName = String(b.employee_name ?? existing.employee_name).trim();
+    const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
+    const positionTitle = String(b.position_title ?? existing.position_title).trim();
+    const employmentStatus = String(b.employment_status ?? existing.employment_status).trim();
+    const startDate = String(b.start_date ?? existing.start_date).trim();
+    const endDate = String(b.end_date ?? existing.end_date).trim();
+    const dateIssued = String(b.date_issued ?? existing.date_issued).trim();
+    const includeSalary =
+      b.include_salary !== undefined ? (b.include_salary ? 1 : 0) : existing.include_salary;
+    const salaryAmount = includeSalary
+      ? Math.max(0, round2(b.salary_amount ?? existing.salary_amount))
+      : 0;
+
+    if (!employeeName) return res.status(400).json({ error: 'Employee full name is required.' });
+    if (!positionTitle) return res.status(400).json({ error: 'Job title or position is required.' });
+    if (!employmentStatus) return res.status(400).json({ error: 'Employment status is required.' });
+    if (!startDate) return res.status(400).json({ error: 'Employment start date is required.' });
+    if (endDate && startDate > endDate) {
+      return res
+        .status(400)
+        .json({ error: 'Employment end date cannot be earlier than start date.' });
+    }
+    if (!dateIssued) return res.status(400).json({ error: 'Date of issuance is required.' });
+    if (includeSalary && salaryAmount <= 0) {
+      return res.status(400).json({
+        error:
+          'Please enter the verified compensation amount when "Include Salary Details" is enabled.',
+      });
+    }
+
+    await dbRun(
+      `UPDATE certificates_of_employment
+       SET employee_id = ?, employee_code = ?, employee_name = ?, position_title = ?, department = ?,
+           employment_type = ?, employment_status = ?, start_date = ?, end_date = ?, date_issued = ?, purpose = ?,
+           include_salary = ?, salary_amount = ?, salary_period = ?, custom_body = ?,
+           signatory_name = ?, signatory_title = ?, signature_url = ?, remarks = ?, updated_at = ?
+       WHERE id = ?`,
+      [
+        employeeId,
+        employeeCode,
+        employeeName,
+        positionTitle,
+        String(b.department ?? existing.department).trim(),
+        String(b.employment_type ?? existing.employment_type).trim(),
+        employmentStatus,
+        startDate,
+        endDate,
+        dateIssued,
+        String(b.purpose ?? existing.purpose).trim(),
+        includeSalary,
+        salaryAmount,
+        String(b.salary_period ?? existing.salary_period).trim(),
+        String(b.custom_body ?? existing.custom_body).trim(),
+        String(b.signatory_name ?? existing.signatory_name).trim(),
+        String(b.signatory_title ?? existing.signatory_title).trim(),
+        String(b.signature_url ?? existing.signature_url).trim(),
+        String(b.remarks ?? existing.remarks).trim(),
+        nowISO(),
+        id,
+      ]
+    );
+
+    res.json({
+      certificate: await dbGet('SELECT * FROM certificates_of_employment WHERE id = ?', [id]),
+    });
+  })
+);
+
+app.delete(
+  '/api/certificates-of-employment/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet(
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
+      [id]
+    );
+    if (!existing) return res.status(404).json({ error: 'Certificate of Employment not found.' });
+    await dbRun(
+      'UPDATE certificates_of_employment SET is_archived = 1, updated_at = ? WHERE id = ?',
+      [nowISO(), id]
+    );
+    res.json({ ok: true });
+  })
+);
+
+app.get(
+  '/api/certificates-of-employment/:id/pdf',
+  asyncHandler(async (req, res) => {
+    const certificate = await dbGet(
+      'SELECT * FROM certificates_of_employment WHERE id = ? AND is_archived = 0',
+      [Number(req.params.id)]
+    );
+    if (!certificate) return res.status(404).json({ error: 'Certificate of Employment not found.' });
+    const settings = await getSettings();
+    const pdfBuf = await generateCoePdf(certificate, settings);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${certificate.certificate_number}.pdf"`
+    );
+    res.send(pdfBuf);
+  })
+);
+
+// ============================================================================
+// HR & EMPLOYEE DOCUMENTS — 4. EMPLOYEE ID MAKER
+// ============================================================================
+
+app.get(
+  '/api/employee-id-cards/next-number',
+  asyncHandler(async (req, res) => {
+    const dateStr = String(req.query.date || todayYMD());
+    res.json({ next_number: await previewNextDocNumber('id_card', dateStr) });
+  })
+);
+
+app.get(
+  '/api/employee-id-cards',
+  asyncHandler(async (req, res) => {
+    const search = String(req.query.search || '').trim();
+    const status = String(req.query.status || 'all');
+    const employeeId = Number(req.query.employee_id || 0);
+
+    let where = 'WHERE is_archived = 0';
+    const params = [];
+    if (status && status !== 'all') {
+      where += ' AND status = ?';
+      params.push(status);
+    }
+    if (employeeId > 0) {
+      where += ' AND employee_id = ?';
+      params.push(employeeId);
+    }
+    if (search) {
+      where +=
+        ' AND (card_number LIKE ? OR employee_code LIKE ? OR full_name LIKE ? OR position_title LIKE ? OR department LIKE ?)';
+      const lk = `%${search}%`;
+      params.push(lk, lk, lk, lk, lk);
+    }
+
+    const id_cards = await dbAll(
+      `SELECT * FROM employee_id_cards ${where} ORDER BY date_issued DESC, id DESC`,
+      params
+    );
+    res.json({ id_cards });
+  })
+);
+
+app.get(
+  '/api/employee-id-cards/:id',
+  asyncHandler(async (req, res) => {
+    const id_card = await dbGet(
+      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+      [Number(req.params.id)]
+    );
+    if (!id_card) return res.status(404).json({ error: 'Employee ID card not found.' });
+    res.json({ id_card });
+  })
+);
+
+app.post(
+  '/api/employee-id-cards',
+  asyncHandler(async (req, res) => {
+    const idemHit = await getIdempotencyHit(req, 'employee_id');
+    if (idemHit) {
+      const existing = await dbGet(
+        'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+        [idemHit]
+      );
+      if (existing) return res.json({ id_card: existing });
+    }
+
+    const b = req.body || {};
+    const employeeId = b.employee_id ? Number(b.employee_id) : null;
+    const empRow = employeeId
+      ? await dbGet('SELECT * FROM employees WHERE id = ?', [employeeId])
+      : null;
+
+    const employeeCode = String(b.employee_code || empRow?.employee_code || '').trim();
+    const fullName = String(b.full_name || empRow?.full_name || '').trim();
+    const positionTitle = String(b.position_title || empRow?.position_title || '').trim();
+    const dateIssued = String(b.date_issued || '').trim();
+    const expirationDate = String(b.expiration_date || '').trim();
+
+    if (!employeeCode) {
+      return res.status(400).json({ error: 'Employee ID number is required.' });
+    }
+    if (!fullName) {
+      return res.status(400).json({ error: 'Employee full name is required.' });
+    }
+    if (!positionTitle) {
+      return res.status(400).json({ error: 'Position or job title is required.' });
+    }
+    if (!dateIssued) {
+      return res.status(400).json({ error: 'Date issued is required.' });
+    }
+    if (expirationDate && dateIssued > expirationDate) {
+      return res
+        .status(400)
+        .json({ error: 'Expiration date cannot be earlier than date issued.' });
+    }
+
+    // Prevent using an Employee ID code belonging to a different employee in the directory
+    const conflictingDirectoryEmp = await dbGet(
+      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+      [employeeCode]
+    );
+    if (conflictingDirectoryEmp && (!empRow || conflictingDirectoryEmp.id !== empRow.id)) {
+      return res.status(409).json({
+        error: `Employee ID "${conflictingDirectoryEmp.employee_code}" belongs to ${conflictingDirectoryEmp.full_name} in the Employee Directory.`,
+      });
+    }
+
+    const replaceExisting = Boolean(b.replace_existing);
+    const activeCardCollision = await dbGet(
+      `SELECT id, card_number, full_name, employee_id
+       FROM employee_id_cards
+       WHERE is_archived = 0
+         AND status = 'Active'
+         AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
+       LIMIT 1`,
+      [employeeCode]
+    );
+
+    if (activeCardCollision && !replaceExisting) {
+      return res.status(409).json({
+        error: `Duplicate Employee ID number prevented: Active ID card ${activeCardCollision.card_number} already uses Employee ID "${employeeCode}" (${activeCardCollision.full_name}). Open that card to edit or regenerate it.`,
+      });
+    }
+
+    const photoUrl = String(b.photo_url ?? empRow?.photo_url ?? '').trim();
+    const validStatus = ['Active', 'Expired', 'Revoked'].includes(b.status) ? b.status : 'Active';
+
+    const createdId = await runInTransaction(async () => {
+      if (activeCardCollision && replaceExisting) {
+        await dbRun(
+          "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ?",
+          [nowISO(), activeCardCollision.id]
+        );
+      }
+
+      const cardNum = await allocateNextDocNumber('id_card', dateIssued);
+      const settings = await getSettings();
+      const now = nowISO();
+
+      const info = await dbRun(
+        `INSERT INTO employee_id_cards (
+          card_number, employee_id, employee_code, full_name, position_title, department,
+          photo_url, contact_number, address, emergency_contact_name, emergency_contact_number, blood_type,
+          date_issued, expiration_date, authorized_signatory, authorized_title, signature_url, back_notes,
+          status, is_archived, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        [
+          cardNum,
+          empRow ? empRow.id : null,
+          employeeCode,
+          fullName,
+          positionTitle,
+          String(b.department ?? empRow?.department ?? '').trim(),
+          photoUrl,
+          String(b.contact_number ?? empRow?.contact_number ?? '').trim(),
+          String(b.address ?? empRow?.address ?? '').trim(),
+          String(b.emergency_contact_name ?? empRow?.emergency_contact_name ?? '').trim(),
+          String(b.emergency_contact_number ?? empRow?.emergency_contact_number ?? '').trim(),
+          String(b.blood_type || '').trim(),
+          dateIssued,
+          expirationDate,
+          String(b.authorized_signatory ?? settings.authorized_representative ?? '').trim(),
+          String(b.authorized_title ?? settings.authorized_title ?? 'Authorized Representative').trim(),
+          String(b.signature_url ?? settings.signature_url ?? '').trim(),
+          String(b.back_notes || '').trim(),
+          validStatus,
+          now,
+          now,
+        ]
+      );
+
+      // Keep linked Employee Directory photo synchronized when updated on the ID card
+      if (empRow && photoUrl !== empRow.photo_url) {
+        await dbRun('UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ?', [
+          photoUrl,
+          now,
+          empRow.id,
+        ]);
+      }
+
+      const newId = Number(info.lastInsertRowid);
+      await saveIdempotencyKey(req, 'employee_id', newId);
+      await logActivity({
+        entity_type: 'employee_id',
+        entity_id: newId,
+        document_number: cardNum,
+        customer_name: fullName,
+        action: replaceExisting ? 'regenerated' : 'created',
+        summary: `${replaceExisting ? 'Regenerated' : 'Generated'} Employee ID card ${cardNum} (${employeeCode}) for ${fullName}`,
+        actor_name: req.user.full_name,
+      });
+      return newId;
+    });
+
+    res.status(201).json({
+      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [createdId]),
+    });
+  })
+);
+
+app.put(
+  '/api/employee-id-cards/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet(
+      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+      [id]
+    );
+    if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
+
+    const b = req.body || {};
+    const employeeId =
+      b.employee_id !== undefined
+        ? b.employee_id
+          ? Number(b.employee_id)
+          : null
+        : existing.employee_id;
+    const employeeCode = String(b.employee_code ?? existing.employee_code).trim();
+    const fullName = String(b.full_name ?? existing.full_name).trim();
+    const positionTitle = String(b.position_title ?? existing.position_title).trim();
+    const dateIssued = String(b.date_issued ?? existing.date_issued).trim();
+    const expirationDate = String(b.expiration_date ?? existing.expiration_date).trim();
+
+    if (!employeeCode) return res.status(400).json({ error: 'Employee ID number is required.' });
+    if (!fullName) return res.status(400).json({ error: 'Employee full name is required.' });
+    if (!positionTitle) return res.status(400).json({ error: 'Position or job title is required.' });
+    if (!dateIssued) return res.status(400).json({ error: 'Date issued is required.' });
+    if (expirationDate && dateIssued > expirationDate) {
+      return res
+        .status(400)
+        .json({ error: 'Expiration date cannot be earlier than date issued.' });
+    }
+
+    const conflictingDirectoryEmp = await dbGet(
+      'SELECT id, employee_code, full_name FROM employees WHERE LOWER(TRIM(employee_code)) = LOWER(TRIM(?))',
+      [employeeCode]
+    );
+    if (conflictingDirectoryEmp && (!employeeId || conflictingDirectoryEmp.id !== employeeId)) {
+      return res.status(409).json({
+        error: `Employee ID "${conflictingDirectoryEmp.employee_code}" belongs to ${conflictingDirectoryEmp.full_name} in the Employee Directory.`,
+      });
+    }
+
+    const activeCardCollision = await dbGet(
+      `SELECT id, card_number, full_name
+       FROM employee_id_cards
+       WHERE is_archived = 0
+         AND id != ?
+         AND status = 'Active'
+         AND LOWER(TRIM(employee_code)) = LOWER(TRIM(?))
+       LIMIT 1`,
+      [id, employeeCode]
+    );
+    if (activeCardCollision) {
+      return res.status(409).json({
+        error: `Duplicate Employee ID number prevented: Active ID card ${activeCardCollision.card_number} already uses Employee ID "${employeeCode}".`,
+      });
+    }
+
+    const photoUrl = String(b.photo_url ?? existing.photo_url).trim();
+    const validStatus = ['Active', 'Expired', 'Revoked'].includes(b.status)
+      ? b.status
+      : existing.status;
+    const now = nowISO();
+
+    await runInTransaction(async () => {
+      await dbRun(
+        `UPDATE employee_id_cards
+         SET employee_id = ?, employee_code = ?, full_name = ?, position_title = ?, department = ?,
+             photo_url = ?, contact_number = ?, address = ?, emergency_contact_name = ?, emergency_contact_number = ?, blood_type = ?,
+             date_issued = ?, expiration_date = ?, authorized_signatory = ?, authorized_title = ?, signature_url = ?, back_notes = ?,
+             status = ?, updated_at = ?
+         WHERE id = ?`,
+        [
+          employeeId,
+          employeeCode,
+          fullName,
+          positionTitle,
+          String(b.department ?? existing.department).trim(),
+          photoUrl,
+          String(b.contact_number ?? existing.contact_number).trim(),
+          String(b.address ?? existing.address).trim(),
+          String(b.emergency_contact_name ?? existing.emergency_contact_name).trim(),
+          String(b.emergency_contact_number ?? existing.emergency_contact_number).trim(),
+          String(b.blood_type ?? existing.blood_type).trim(),
+          dateIssued,
+          expirationDate,
+          String(b.authorized_signatory ?? existing.authorized_signatory).trim(),
+          String(b.authorized_title ?? existing.authorized_title).trim(),
+          String(b.signature_url ?? existing.signature_url).trim(),
+          String(b.back_notes ?? existing.back_notes).trim(),
+          validStatus,
+          now,
+          id,
+        ]
+      );
+
+      if (employeeId) {
+        await dbRun('UPDATE employees SET photo_url = ?, updated_at = ? WHERE id = ?', [
+          photoUrl,
+          now,
+          employeeId,
+        ]);
+      }
+    });
+
+    res.json({
+      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [id]),
+    });
+  })
+);
+
+app.post(
+  '/api/employee-id-cards/:id/regenerate',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet(
+      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+      [id]
+    );
+    if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
+
+    const empRow = existing.employee_id
+      ? await dbGet('SELECT * FROM employees WHERE id = ?', [existing.employee_id])
+      : null;
+
+    const newCardId = await runInTransaction(async () => {
+      const issueDate = req.body?.date_issued || todayYMD();
+      const now = nowISO();
+      await dbRun(
+        "UPDATE employee_id_cards SET status = 'Revoked', is_archived = 1, updated_at = ? WHERE id = ?",
+        [now, id]
+      );
+
+      const cardNum = await allocateNextDocNumber('id_card', issueDate);
+      const settings = await getSettings();
+
+      const info = await dbRun(
+        `INSERT INTO employee_id_cards (
+          card_number, employee_id, employee_code, full_name, position_title, department,
+          photo_url, contact_number, address, emergency_contact_name, emergency_contact_number, blood_type,
+          date_issued, expiration_date, authorized_signatory, authorized_title, signature_url, back_notes,
+          status, is_archived, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 0, ?, ?)`,
+        [
+          cardNum,
+          empRow ? empRow.id : existing.employee_id,
+          empRow ? empRow.employee_code : existing.employee_code,
+          empRow ? empRow.full_name : existing.full_name,
+          empRow ? empRow.position_title : existing.position_title,
+          empRow ? empRow.department : existing.department,
+          empRow?.photo_url || existing.photo_url,
+          empRow ? empRow.contact_number : existing.contact_number,
+          empRow ? empRow.address : existing.address,
+          empRow ? empRow.emergency_contact_name : existing.emergency_contact_name,
+          empRow ? empRow.emergency_contact_number : existing.emergency_contact_number,
+          existing.blood_type,
+          issueDate,
+          req.body?.expiration_date ?? existing.expiration_date,
+          settings.authorized_representative || existing.authorized_signatory,
+          settings.authorized_title || existing.authorized_title,
+          settings.signature_url || existing.signature_url,
+          existing.back_notes,
+          now,
+          now,
+        ]
+      );
+      const createdId = Number(info.lastInsertRowid);
+      await logActivity({
+        entity_type: 'employee_id',
+        entity_id: createdId,
+        document_number: cardNum,
+        customer_name: empRow ? empRow.full_name : existing.full_name,
+        action: 'regenerated',
+        summary: `Regenerated Employee ID ${cardNum} (${existing.employee_code})`,
+        actor_name: req.user.full_name,
+      });
+      return createdId;
+    });
+
+    res.status(201).json({
+      id_card: await dbGet('SELECT * FROM employee_id_cards WHERE id = ?', [newCardId]),
+    });
+  })
+);
+
+app.delete(
+  '/api/employee-id-cards/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const existing = await dbGet(
+      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+      [id]
+    );
+    if (!existing) return res.status(404).json({ error: 'Employee ID card not found.' });
+    await dbRun('UPDATE employee_id_cards SET is_archived = 1, updated_at = ? WHERE id = ?', [
+      nowISO(),
+      id,
+    ]);
+    res.json({ ok: true });
+  })
+);
+
+app.get(
+  '/api/employee-id-cards/:id/pdf',
+  asyncHandler(async (req, res) => {
+    const card = await dbGet(
+      'SELECT * FROM employee_id_cards WHERE id = ? AND is_archived = 0',
+      [Number(req.params.id)]
+    );
+    if (!card) return res.status(404).json({ error: 'Employee ID card not found.' });
+    const settings = await getSettings();
+    const pdfBuf = await generateEmployeeIdPdf(card, settings);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="Employee-ID-${card.employee_code}.pdf"`
+    );
+    res.send(pdfBuf);
+  })
+);
+
+// ============================================================================
 // BACKUP, DATA EXPORT & RESTORE
 // ============================================================================
 
@@ -2972,6 +4579,10 @@ app.get(
       'service_report_photos',
       'billing_statements',
       'billing_statement_lines',
+      'employees',
+      'payslips',
+      'certificates_of_employment',
+      'employee_id_cards',
       'activity_logs',
     ];
 
@@ -3040,6 +4651,10 @@ app.post(
         'customer_prefix',
         'product_prefix',
         'payment_prefix',
+        'employee_prefix',
+        'payslip_prefix',
+        'coe_prefix',
+        'id_card_prefix',
         'doc_number_padding',
         'include_year_in_doc_num',
         'default_payment_terms',
@@ -3279,6 +4894,123 @@ app.post(
         'credit',
         'running_balance',
       ],
+      employees: [
+        'id',
+        'employee_code',
+        'full_name',
+        'position_title',
+        'department',
+        'employment_type',
+        'employment_status',
+        'start_date',
+        'end_date',
+        'contact_number',
+        'email',
+        'address',
+        'emergency_contact_name',
+        'emergency_contact_number',
+        'pay_basis',
+        'default_rate',
+        'photo_url',
+        'notes',
+        'is_active',
+        'created_at',
+        'updated_at',
+      ],
+      payslips: [
+        'id',
+        'payslip_number',
+        'employee_id',
+        'employee_code',
+        'employee_name',
+        'position_title',
+        'department',
+        'pay_period_start',
+        'pay_period_end',
+        'payment_date',
+        'pay_basis',
+        'base_rate',
+        'days_worked',
+        'hours_worked',
+        'regular_pay',
+        'overtime_hours',
+        'overtime_rate',
+        'overtime_pay',
+        'allowances',
+        'bonuses',
+        'other_earnings',
+        'other_earnings_note',
+        'sss_deduction',
+        'philhealth_deduction',
+        'pagibig_deduction',
+        'withholding_tax',
+        'cash_advance',
+        'other_deductions',
+        'other_deductions_note',
+        'total_earnings',
+        'total_deductions',
+        'net_pay',
+        'payment_method',
+        'remarks',
+        'prepared_by',
+        'approved_by',
+        'employee_signature_url',
+        'status',
+        'is_archived',
+        'created_at',
+        'updated_at',
+      ],
+      certificates_of_employment: [
+        'id',
+        'certificate_number',
+        'employee_id',
+        'employee_code',
+        'employee_name',
+        'position_title',
+        'department',
+        'employment_type',
+        'employment_status',
+        'start_date',
+        'end_date',
+        'date_issued',
+        'purpose',
+        'include_salary',
+        'salary_amount',
+        'salary_period',
+        'custom_body',
+        'signatory_name',
+        'signatory_title',
+        'signature_url',
+        'remarks',
+        'is_archived',
+        'created_at',
+        'updated_at',
+      ],
+      employee_id_cards: [
+        'id',
+        'card_number',
+        'employee_id',
+        'employee_code',
+        'full_name',
+        'position_title',
+        'department',
+        'photo_url',
+        'contact_number',
+        'address',
+        'emergency_contact_name',
+        'emergency_contact_number',
+        'blood_type',
+        'date_issued',
+        'expiration_date',
+        'authorized_signatory',
+        'authorized_title',
+        'signature_url',
+        'back_notes',
+        'status',
+        'is_archived',
+        'created_at',
+        'updated_at',
+      ],
       activity_logs: [
         'id',
         'entity_type',
@@ -3298,6 +5030,10 @@ app.post(
       await runInTransaction(async () => {
         // Delete child tables before parent tables so foreign keys remain satisfied on all engines
         const orderedDelete = [
+          'employee_id_cards',
+          'certificates_of_employment',
+          'payslips',
+          'employees',
           'billing_statement_lines',
           'billing_statements',
           'service_report_photos',
@@ -3354,6 +5090,10 @@ app.post(
           'service_report_photos',
           'billing_statements',
           'billing_statement_lines',
+          'employees',
+          'payslips',
+          'certificates_of_employment',
+          'employee_id_cards',
           'activity_logs',
         ];
         for (const t of orderedInsert) {
@@ -3410,6 +5150,14 @@ app.get(
         'SELECT report_number, service_date, job_type, customer_name, service_location, equipment_serviced, technician_name, materials_total_cost, status, created_at FROM service_reports WHERE is_archived = 0 ORDER BY id ASC',
       'billing-statements':
         'SELECT statement_number, statement_date, period_from, period_to, customer_name, previous_balance, total_charges, total_payments, outstanding_balance, created_at FROM billing_statements WHERE is_archived = 0 ORDER BY id ASC',
+      employees:
+        'SELECT employee_code, full_name, position_title, department, employment_type, employment_status, start_date, end_date, contact_number, email, address, emergency_contact_name, emergency_contact_number, pay_basis, default_rate, is_active, created_at FROM employees ORDER BY id ASC',
+      payslips:
+        'SELECT payslip_number, employee_code, employee_name, position_title, pay_period_start, pay_period_end, payment_date, pay_basis, base_rate, regular_pay, overtime_pay, allowances, bonuses, other_earnings, total_earnings, sss_deduction, philhealth_deduction, pagibig_deduction, withholding_tax, cash_advance, other_deductions, total_deductions, net_pay, status, created_at FROM payslips WHERE is_archived = 0 ORDER BY id ASC',
+      'certificates-of-employment':
+        'SELECT certificate_number, employee_code, employee_name, position_title, department, employment_status, start_date, end_date, date_issued, purpose, include_salary, salary_amount, salary_period, signatory_name, created_at FROM certificates_of_employment WHERE is_archived = 0 ORDER BY id ASC',
+      'employee-id-cards':
+        'SELECT card_number, employee_code, full_name, position_title, department, date_issued, expiration_date, emergency_contact_name, emergency_contact_number, status, created_at FROM employee_id_cards WHERE is_archived = 0 ORDER BY id ASC',
     };
 
     const sql = queryMap[entity];
