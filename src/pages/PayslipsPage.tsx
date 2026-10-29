@@ -23,7 +23,6 @@ import {
   resolveAssetUrl,
   round2,
   todayYMD,
-  uploadSignatureDataUrl,
 } from '../lib/api';
 import { EmployeePicker } from '../components/EmployeePicker';
 import { PrintablePayslip } from '../components/HrPrintableDocuments';
@@ -119,6 +118,26 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
       onClearInitial();
     }
   }, [initialOpenId, initialCreateNew, prefillEmployeeId]);
+
+  const syncBrowserUrl = (id?: number | null) => {
+    if (typeof window === 'undefined') return;
+    const nextPath = id ? `/payslips/${id}` : '/payslips';
+    if (window.location.pathname !== nextPath) {
+      window.history.replaceState({}, '', nextPath);
+    }
+  };
+
+  const returnToList = () => {
+    setSigModalOpen(false);
+    setMode('list');
+    syncBrowserUrl(null);
+  };
+
+  useEffect(() => {
+    if (mode === 'edit' && !editingId && !approvedBy && settings.authorized_representative) {
+      setApprovedBy(settings.authorized_representative);
+    }
+  }, [mode, editingId, approvedBy, settings.authorized_representative]);
 
   const applyEmployeeSelection = (emp: Employee) => {
     setEmployeeId(emp.id);
@@ -224,10 +243,12 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
 
   const openPayslip = async (id: number, targetMode: 'edit' | 'preview') => {
     setError('');
+    setSigModalOpen(false);
     try {
       const res = await apiFetch<{ payslip: Payslip }>(`/api/payslips/${id}`);
       populateFromSaved(res.payslip);
       setMode(targetMode);
+      syncBrowserUrl(res.payslip.id);
     } catch (err: any) {
       setError(err.message || 'Failed to open payslip.');
     }
@@ -378,6 +399,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
       setPageNotice(`Saved payslip ${res.payslip.payslip_number}.`);
       fetchPayslips();
       setMode('preview');
+      syncBrowserUrl(res.payslip.id);
     } catch (err: any) {
       setError(err.message || 'Failed to save payslip.');
     } finally {
@@ -390,7 +412,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
     try {
       await apiFetch(`/api/payslips/${p.id}`, { method: 'DELETE' });
       setPageNotice(`Archived payslip ${p.payslip_number}.`);
-      setMode('list');
+      returnToList();
       fetchPayslips();
     } catch (err: any) {
       setError(err.message || 'Failed to archive payslip.');
@@ -406,7 +428,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
         <div className="no-print flex flex-wrap items-center justify-between gap-3 bg-white border border-slate-200 rounded-md p-3.5">
           <button
             type="button"
-            onClick={() => setMode('list')}
+            onClick={returnToList}
             className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-slate-900"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -469,7 +491,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setMode('list')}
+              onClick={returnToList}
               className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 hover:text-slate-900"
             >
               <ArrowLeft className="w-4 h-4" />
@@ -1082,7 +1104,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
           <div className="flex justify-end gap-2">
             <button
               type="button"
-              onClick={() => setMode('list')}
+              onClick={returnToList}
               className="px-4 py-2.5 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"
             >
               Cancel
@@ -1098,16 +1120,16 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
           </div>
         </form>
 
-        <SignaturePadModal
-          isOpen={sigModalOpen}
-          title="Employee Acknowledgment Signature"
-          onClose={() => setSigModalOpen(false)}
-          onSave={async (dataUrl) => {
-            const uploaded = await uploadSignatureDataUrl(dataUrl);
-            setEmployeeSignatureUrl(uploaded.url);
-            setSigModalOpen(false);
-          }}
-        />
+        {sigModalOpen && (
+          <SignaturePadModal
+            title="Employee Acknowledgment Signature"
+            onClose={() => setSigModalOpen(false)}
+            onSaved={(url) => {
+              setEmployeeSignatureUrl(url);
+              setSigModalOpen(false);
+            }}
+          />
+        )}
       </div>
     );
   }

@@ -118,6 +118,7 @@
   }
 
   #johnrois-print-sheet tr,
+  .cr80-card,
   .print-avoid-break {
     break-inside: avoid !important;
     page-break-inside: avoid !important;

@@ -23,7 +23,6 @@ import {
   resolveAssetUrl,
   round2,
   todayYMD,
-  uploadSignatureDataUrl,
 } from '../lib/api';
 import { EmployeePicker } from '../components/EmployeePicker';
 import { PrintableCoe } from '../components/HrPrintableDocuments';
@@ -105,6 +104,40 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
       onClearInitial();
     }
   }, [initialOpenId, initialCreateNew, prefillEmployeeId]);
+
+  const syncBrowserUrl = (id?: number | null) => {
+    if (typeof window === 'undefined') return;
+    const nextPath = id
+      ? `/certificates-of-employment/${id}`
+      : '/certificates-of-employment';
+    if (window.location.pathname !== nextPath) {
+      window.history.replaceState({}, '', nextPath);
+    }
+  };
+
+  const returnToList = () => {
+    setSigModalOpen(false);
+    setMode('list');
+    syncBrowserUrl(null);
+  };
+
+  useEffect(() => {
+    if (mode === 'edit' && !editingId) {
+      if (!signatoryName && settings.authorized_representative) {
+        setSignatoryName(settings.authorized_representative);
+      }
+      if (!signatureUrl && settings.signature_url) {
+        setSignatureUrl(settings.signature_url);
+      }
+    }
+  }, [
+    mode,
+    editingId,
+    signatoryName,
+    signatureUrl,
+    settings.authorized_representative,
+    settings.signature_url,
+  ]);
 
   const applyEmployeeSelection = (emp: Employee) => {
     setEmployeeId(emp.id);
@@ -190,12 +223,14 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
 
   const openCertificate = async (id: number, targetMode: 'edit' | 'preview') => {
     setError('');
+    setSigModalOpen(false);
     try {
       const res = await apiFetch<{ certificate: CertificateOfEmployment }>(
         `/api/certificates-of-employment/${id}`
       );
       populateFromSaved(res.certificate);
       setMode(targetMode);
+      syncBrowserUrl(res.certificate.id);
     } catch (err: any) {
       setError(err.message || 'Failed to open Certificate of Employment.');
     }
@@ -283,6 +318,7 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
       setPageNotice(`Saved Certificate of Employment ${res.certificate.certificate_number}.`);
       fetchCertificates();
       setMode('preview');
+      syncBrowserUrl(res.certificate.id);
     } catch (err: any) {
       setError(err.message || 'Failed to save Certificate of Employment.');
     } finally {
@@ -301,7 +337,7 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
     try {
       await apiFetch(`/api/certificates-of-employment/${c.id}`, { method: 'DELETE' });
       setPageNotice(`Archived ${c.certificate_number}.`);
-      setMode('list');
+      returnToList();
       fetchCertificates();
     } catch (err: any) {
       setError(err.message || 'Failed to archive certificate.');
@@ -317,7 +353,7 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
         <div className="no-print flex flex-wrap items-center justify-between gap-3 bg-white border border-slate-200 rounded-md p-3.5">
           <button
             type="button"
-            onClick={() => setMode('list')}
+            onClick={returnToList}
             className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-slate-900"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -380,7 +416,7 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setMode('list')}
+              onClick={returnToList}
               className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 hover:text-slate-900"
             >
               <ArrowLeft className="w-4 h-4" />
@@ -427,6 +463,12 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
               onSelect={applyEmployeeSelection}
               includeInactive
             />
+
+            {employeeId && !startDate && (
+              <div className="p-2.5 rounded bg-amber-50 border border-amber-200 text-xs text-amber-800">
+                This employee does not have a start date recorded in Employee Directory yet. Please enter their verified Employment Start Date below before saving.
+              </div>
+            )}
 
             <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
               <div>
@@ -567,7 +609,21 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
                 <input
                   type="checkbox"
                   checked={includeSalary}
-                  onChange={(e) => setIncludeSalary(e.target.checked)}
+                  onChange={async (e) => {
+                    const checked = e.target.checked;
+                    setIncludeSalary(checked);
+                    if (checked && !salaryAmount && employeeId) {
+                      try {
+                        const empRes = await apiFetch<{ employee: Employee }>(
+                          `/api/employees/${employeeId}`
+                        );
+                        if (empRes.employee && empRes.employee.default_rate > 0) {
+                          setSalaryAmount(String(empRes.employee.default_rate));
+                          setSalaryPeriod(empRes.employee.pay_basis || 'monthly');
+                        }
+                      } catch (_) {}
+                    }
+                  }}
                   className="rounded border-slate-300"
                 />
                 Include Salary / Compensation Details on this COE
@@ -701,7 +757,7 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
           <div className="flex justify-end gap-2">
             <button
               type="button"
-              onClick={() => setMode('list')}
+              onClick={returnToList}
               className="px-4 py-2.5 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"
             >
               Cancel
@@ -717,16 +773,16 @@ export const CertificatesOfEmploymentPage: React.FC<CertificatesOfEmploymentPage
           </div>
         </form>
 
-        <SignaturePadModal
-          isOpen={sigModalOpen}
-          title="Authorized Signatory Signature"
-          onClose={() => setSigModalOpen(false)}
-          onSave={async (dataUrl) => {
-            const uploaded = await uploadSignatureDataUrl(dataUrl);
-            setSignatureUrl(uploaded.url);
-            setSigModalOpen(false);
-          }}
-        />
+        {sigModalOpen && (
+          <SignaturePadModal
+            title="Authorized Signatory Signature"
+            onClose={() => setSigModalOpen(false)}
+            onSaved={(url) => {
+              setSignatureUrl(url);
+              setSigModalOpen(false);
+            }}
+          />
+        )}
       </div>
     );
   }
