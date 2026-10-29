@@ -16,10 +16,12 @@ import {
 import { BusinessSettings, Employee, PayBasis, Payslip, PayslipStatus } from '../types';
 import {
   apiFetch,
+  buildWorkspacePath,
   downloadAuthenticatedFile,
   formatDate,
   formatPHP,
   generateIdempotencyKey,
+  getActiveBusinessSlug,
   resolveAssetUrl,
   round2,
   todayYMD,
@@ -121,7 +123,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
 
   const syncBrowserUrl = (id?: number | null) => {
     if (typeof window === 'undefined') return;
-    const nextPath = id ? `/payslips/${id}` : '/payslips';
+    const nextPath = buildWorkspacePath(id ? `/payslips/${id}` : '/payslips');
     if (window.location.pathname !== nextPath) {
       window.history.replaceState({}, '', nextPath);
     }
@@ -1152,7 +1154,7 @@ export const PayslipsPage: React.FC<PayslipsPageProps> = ({
             onClick={() =>
               downloadAuthenticatedFile(
                 '/api/backup/export-csv/payslips',
-                `johnrois-payslips-${todayYMD()}.csv`
+                `${getActiveBusinessSlug() || 'workspace'}-payslips-${todayYMD()}.csv`
               ).catch((err) => setError(err.message))
             }
             className="inline-flex items-center gap-1.5 px-3 py-2 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"

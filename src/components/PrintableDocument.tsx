@@ -171,12 +171,15 @@ export const PrintableDocument: React.FC<PrintableDocumentProps> = ({
               <img
                 src={resolveAssetUrl(settings.logo_url)}
                 alt={settings.business_name}
+                onError={(e) => {
+                  (e.currentTarget as HTMLImageElement).style.display = 'none';
+                }}
                 className="w-16 h-16 object-contain shrink-0"
               />
             ) : null}
             <div className="space-y-0.5">
               <h1 className="text-lg font-bold tracking-tight text-slate-950 uppercase">
-                {settings.business_name || 'Johnrois Stainless Steel Fabrication Shop'}
+                {settings.business_name || 'Stainless Steel Fabrication'}
               </h1>
               {settings.address && (
                 <p className="text-xs text-slate-700 max-w-md leading-relaxed">{settings.address}</p>

@@ -1,8 +1,75 @@
+import { BusinessSlug } from '../types';
+
 const RAW_API_BASE = (
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_API_BASE_URL || ''
 )
   .trim()
   .replace(/\/+$/, '');
+
+export function normalizeBusinessSlug(raw: string | null | undefined): BusinessSlug | null {
+  const val = String(raw || '')
+    .trim()
+    .toLowerCase();
+  if (val === 'john-rois' || val === 'johnrois' || val === '1') return 'john-rois';
+  if (val === 'jrec' || val === '2') return 'jrec';
+  return null;
+}
+
+export function parseBusinessSlugFromPathname(pathname: string): BusinessSlug | null {
+  const firstSegment = pathname
+    .replace(/^\/+|\/+$/g, '')
+    .split('/')
+    .filter(Boolean)[0];
+  return normalizeBusinessSlug(firstSegment);
+}
+
+let activeBusinessSlug: BusinessSlug | null =
+  typeof window !== 'undefined'
+    ? parseBusinessSlugFromPathname(window.location.pathname)
+    : null;
+
+let activeMutationCount = 0;
+
+export function setActiveBusinessSlug(slug: BusinessSlug | null): void {
+  activeBusinessSlug = slug;
+}
+
+export function getActiveBusinessSlug(): BusinessSlug | null {
+  if (activeBusinessSlug) return activeBusinessSlug;
+  if (typeof window !== 'undefined') {
+    const fromPath = parseBusinessSlugFromPathname(window.location.pathname);
+    if (fromPath) {
+      activeBusinessSlug = fromPath;
+      return fromPath;
+    }
+  }
+  return null;
+}
+
+export function hasInFlightMutations(): boolean {
+  return activeMutationCount > 0;
+}
+
+export function buildWorkspacePath(subpath: string, explicitSlug?: BusinessSlug | null): string {
+  const slug = explicitSlug || getActiveBusinessSlug();
+  const cleanSub = subpath.startsWith('/') ? subpath : `/${subpath}`;
+  if (!slug) return cleanSub;
+  if (cleanSub === '/') return `/${slug}`;
+  return `/${slug}${cleanSub}`;
+}
+
+export function getBusinessMonogram(businessName?: string | null, fallback = 'WS'): string {
+  const name = String(businessName || '').trim();
+  if (!name) return fallback;
+  if (/^jrec\b/i.test(name)) return 'JREC';
+  if (/^john\s*rois\b/i.test(name)) return 'JR';
+  const words = name.split(/\s+/).filter(Boolean);
+  if (words.length === 1) return words[0].slice(0, 4).toUpperCase();
+  return words
+    .slice(0, 3)
+    .map((w) => w[0].toUpperCase())
+    .join('');
+}
 
 export function resolveApiUrl(url: string): string {
   if (!url) return url;
@@ -25,13 +92,44 @@ export function generateIdempotencyKey(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+export async function apiPublicFetch<T = any>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(resolveApiUrl(url), options);
+  } catch (_) {
+    throw new Error(
+      'Unable to connect to the backend server. Please verify your network or server connection and try again.'
+    );
+  }
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (!res.ok) {
+    let errMsg = `Request failed (HTTP ${res.status})`;
+    if (contentType.includes('application/json')) {
+      try {
+        const data = await res.json();
+        if (data?.error) errMsg = data.error;
+      } catch (_) {}
+    }
+    throw new Error(errMsg);
+  }
+  return res.json();
+}
+
 export async function apiFetch<T = any>(
   url: string,
-  options: RequestInit & { idempotencyKey?: string } = {}
+  options: RequestInit & { idempotencyKey?: string; businessSlug?: BusinessSlug } = {}
 ): Promise<T> {
   const headers: Record<string, string> = {
     ...(options.headers as Record<string, string>),
   };
+
+  const resolvedSlug = options.businessSlug || getActiveBusinessSlug();
+  if (resolvedSlug && !headers['X-Business-Id']) {
+    headers['X-Business-Id'] = resolvedSlug;
+  }
 
   if (options.idempotencyKey) {
     headers['X-Idempotency-Key'] = options.idempotencyKey;
@@ -40,50 +138,60 @@ export async function apiFetch<T = any>(
     headers['Content-Type'] = 'application/json';
   }
 
-  let res: Response;
+  const method = (options.method || 'GET').toUpperCase();
+  const isMutation = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method);
+  if (isMutation) activeMutationCount++;
+
   try {
-    res = await fetch(resolveApiUrl(url), {
-      ...options,
-      headers,
-    });
-  } catch (_) {
-    throw new Error(
-      'Unable to connect to the backend server. Please verify your network or server connection and try again.'
-    );
-  }
-
-  const contentType = (res.headers.get('content-type') || '').toLowerCase();
-
-  if (!res.ok) {
-    let errMsg = `Request failed (HTTP ${res.status})`;
-    let extra: Record<string, any> = {};
-    if (contentType.includes('application/json')) {
-      try {
-        const data = await res.json();
-        if (data?.error) errMsg = data.error;
-        extra = data;
-      } catch (_) {
-        // ignore json parse error
-      }
-    } else if (res.status === 413) {
-      errMsg =
-        'Uploaded image or request exceeds the serverless payload limit (~4 MB). Please try a slightly smaller image.';
-    } else if (res.status === 404) {
-      errMsg = `API endpoint not found (${url}).`;
+    let res: Response;
+    try {
+      res = await fetch(resolveApiUrl(url), {
+        ...options,
+        headers,
+      });
+    } catch (_) {
+      throw new Error(
+        'Unable to connect to the backend server. Please verify your network or server connection and try again.'
+      );
     }
-    const err = new Error(errMsg) as Error & { status?: number; data?: any };
-    err.status = res.status;
-    err.data = extra;
-    throw err;
-  }
 
-  if (!contentType.includes('application/json')) {
-    throw new Error(
-      'Backend API returned a non-JSON response. Please check that serverless API routing is active.'
-    );
-  }
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
 
-  return res.json();
+    if (!res.ok) {
+      let errMsg = `Request failed (HTTP ${res.status})`;
+      let extra: Record<string, any> = {};
+      if (contentType.includes('application/json')) {
+        try {
+          const data = await res.json();
+          if (data?.error) errMsg = data.error;
+          extra = data;
+        } catch (_) {
+          // ignore json parse error
+        }
+      } else if (res.status === 413) {
+        errMsg =
+          'Uploaded image or request exceeds the serverless payload limit (~4 MB). Please try a slightly smaller image.';
+      } else if (res.status === 404) {
+        errMsg = `API endpoint not found (${url}).`;
+      }
+      const err = new Error(errMsg) as Error & { status?: number; data?: any };
+      err.status = res.status;
+      err.data = extra;
+      throw err;
+    }
+
+    if (!contentType.includes('application/json')) {
+      throw new Error(
+        'Backend API returned a non-JSON response. Please check that serverless API routing is active.'
+      );
+    }
+
+    return res.json();
+  } finally {
+    if (isMutation) {
+      activeMutationCount = Math.max(0, activeMutationCount - 1);
+    }
+  }
 }
 
 const MAX_SERVERLESS_IMAGE_BYTES = 2.4 * 1024 * 1024;
@@ -92,17 +200,19 @@ const MAX_IMAGE_DIMENSION = 2000;
 async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
   const lowerName = (file.name || '').toLowerCase();
   const lowerType = (file.type || '').toLowerCase();
-  const isJpeg = lowerType === 'image/jpeg' || lowerType === 'image/jpg' || /\.jpe?g$/.test(lowerName);
+  const isJpeg =
+    lowerType === 'image/jpeg' || lowerType === 'image/jpg' || /\.jpe?g$/.test(lowerName);
   const isNativePdfImage =
     ['image/png', 'image/jpeg', 'image/jpg'].includes(lowerType) &&
     /\.(png|jpe?g)$/.test(lowerName);
 
-  // Keep native PNG/JPEG untouched when already compact enough for Vercel's 4.5 MB payload limit
-  if ((isNativePdfImage && file.size <= MAX_SERVERLESS_IMAGE_BYTES) || typeof document === 'undefined') {
+  if (
+    (isNativePdfImage && file.size <= MAX_SERVERLESS_IMAGE_BYTES) ||
+    typeof document === 'undefined'
+  ) {
     return file;
   }
 
-  // Convert WEBP / SVG / GIF to PNG (for PDFKit compatibility) and scale down oversized camera photos
   return new Promise((resolve) => {
     const objectUrl = URL.createObjectURL(file);
     const img = new Image();
@@ -128,7 +238,6 @@ async function normalizeImageForPdfCompatibility(file: File): Promise<File> {
         const outMime = preferJpeg ? 'image/jpeg' : 'image/png';
         const outExt = preferJpeg ? 'jpg' : 'png';
         if (preferJpeg) {
-          // Fill white background before JPEG encode so transparent pixels don't turn black
           const composite = document.createElement('canvas');
           composite.width = w;
           composite.height = h;
@@ -206,7 +315,6 @@ export async function uploadImageFile(file: File): Promise<{ url: string; filena
       body: formData,
     });
   } catch (primaryErr: any) {
-    // Automatic JSON base64 fallback if an edge proxy interferes with multipart/form-data
     if (primaryErr?.status === 503 || primaryErr?.data?.setup_required) {
       throw primaryErr;
     }
@@ -228,9 +336,15 @@ export async function uploadSignatureDataUrl(
 }
 
 export async function downloadAuthenticatedFile(url: string, fallbackFilename: string) {
+  const headers: Record<string, string> = {};
+  const slug = getActiveBusinessSlug();
+  if (slug) {
+    headers['X-Business-Id'] = slug;
+  }
+
   let res: Response;
   try {
-    res = await fetch(resolveApiUrl(url));
+    res = await fetch(resolveApiUrl(url), { headers });
   } catch (_) {
     throw new Error('Unable to reach server to download file.');
   }

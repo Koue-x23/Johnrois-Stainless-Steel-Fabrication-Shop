@@ -6,6 +6,7 @@ import {
   downloadAuthenticatedFile,
   formatDate,
   formatPHP,
+  getActiveBusinessSlug,
   todayYMD,
 } from '../lib/api';
 import { StatusBadge } from '../components/StatusBadge';
@@ -332,7 +333,7 @@ export const ReportsPage: React.FC<ReportsPageProps> = ({ onNavigate }) => {
                     try {
                       await downloadAuthenticatedFile(
                         `/api/backup/export-csv/${slug}`,
-                        `johnrois-${slug}-${today}.csv`
+                        `${getActiveBusinessSlug() || 'workspace'}-${slug}-${today}.csv`
                       );
                     } catch (err: any) {
                       setExportError(err.message || 'CSV export failed.');

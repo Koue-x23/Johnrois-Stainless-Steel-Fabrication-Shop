@@ -1,5 +1,18 @@
 export type UserRole = 'owner' | 'staff' | 'technician';
 
+export type BusinessSlug = 'john-rois' | 'jrec';
+
+export interface BusinessSummary {
+  id: number;
+  slug: BusinessSlug;
+  default_name: string;
+  short_code: string;
+  business_name: string;
+  logo_url: string;
+  address: string;
+  contact_number: string;
+}
+
 export interface AuthUser {
   id: number;
   username: string;
@@ -13,6 +26,7 @@ export interface AuthUser {
 
 export interface BusinessSettings {
   id: number;
+  business_id?: number;
   business_name: string;
   logo_url: string;
   address: string;
