@@ -24,7 +24,6 @@ import {
   resolveAssetUrl,
   todayYMD,
   uploadImageFile,
-  uploadSignatureDataUrl,
 } from '../lib/api';
 import { EmployeePicker } from '../components/EmployeePicker';
 import {
@@ -114,6 +113,38 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
     }
   }, [initialOpenId, initialCreateNew, prefillEmployeeId]);
 
+  const syncBrowserUrl = (id?: number | null) => {
+    if (typeof window === 'undefined') return;
+    const nextPath = id ? `/employee-ids/${id}` : '/employee-ids';
+    if (window.location.pathname !== nextPath) {
+      window.history.replaceState({}, '', nextPath);
+    }
+  };
+
+  const returnToList = () => {
+    setSigModalOpen(false);
+    setMode('list');
+    syncBrowserUrl(null);
+  };
+
+  useEffect(() => {
+    if (mode === 'edit' && !editingId) {
+      if (!authorizedSignatory && settings.authorized_representative) {
+        setAuthorizedSignatory(settings.authorized_representative);
+      }
+      if (!signatureUrl && settings.signature_url) {
+        setSignatureUrl(settings.signature_url);
+      }
+    }
+  }, [
+    mode,
+    editingId,
+    authorizedSignatory,
+    signatureUrl,
+    settings.authorized_representative,
+    settings.signature_url,
+  ]);
+
   const applyEmployeeSelection = (emp: Employee) => {
     setEmployeeId(emp.id);
     setEmployeeCode(emp.employee_code);
@@ -194,10 +225,12 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
 
   const openCard = async (id: number, targetMode: 'edit' | 'preview') => {
     setError('');
+    setSigModalOpen(false);
     try {
       const res = await apiFetch<{ id_card: EmployeeIdCard }>(`/api/employee-id-cards/${id}`);
       populateFromSaved(res.id_card);
       setMode(targetMode);
+      syncBrowserUrl(res.id_card.id);
     } catch (err: any) {
       setError(err.message || 'Failed to open Employee ID card.');
     }
@@ -288,6 +321,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
       setPageNotice(`Saved Employee ID Card ${res.id_card.card_number} (${res.id_card.employee_code}).`);
       fetchCards();
       setMode('preview');
+      syncBrowserUrl(res.id_card.id);
     } catch (err: any) {
       setError(err.message || 'Failed to save Employee ID card.');
     } finally {
@@ -316,6 +350,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
       setPageNotice(`Regenerated new ID card ${res.id_card.card_number}.`);
       fetchCards();
       setMode('preview');
+      syncBrowserUrl(res.id_card.id);
     } catch (err: any) {
       setError(err.message || 'Failed to regenerate ID card.');
     }
@@ -328,7 +363,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
     try {
       await apiFetch(`/api/employee-id-cards/${card.id}`, { method: 'DELETE' });
       setPageNotice(`Archived Employee ID card ${card.card_number}.`);
-      setMode('list');
+      returnToList();
       fetchCards();
     } catch (err: any) {
       setError(err.message || 'Failed to archive ID card.');
@@ -344,7 +379,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
         <div className="no-print flex flex-wrap items-center justify-between gap-3 bg-white border border-slate-200 rounded-md p-3.5">
           <button
             type="button"
-            onClick={() => setMode('list')}
+            onClick={returnToList}
             className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-700 hover:text-slate-900"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -417,7 +452,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setMode('list')}
+              onClick={returnToList}
               className="inline-flex items-center gap-1 text-xs font-semibold text-slate-700 hover:text-slate-900"
             >
               <ArrowLeft className="w-4 h-4" />
@@ -759,7 +794,7 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
             <div className="flex justify-end gap-2">
               <button
                 type="button"
-                onClick={() => setMode('list')}
+                onClick={returnToList}
                 className="px-4 py-2.5 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50"
               >
                 Cancel
@@ -787,16 +822,16 @@ export const EmployeeIdsPage: React.FC<EmployeeIdsPageProps> = ({
           </div>
         </div>
 
-        <SignaturePadModal
-          isOpen={sigModalOpen}
-          title="Authorized ID Signatory Signature"
-          onClose={() => setSigModalOpen(false)}
-          onSave={async (dataUrl) => {
-            const uploaded = await uploadSignatureDataUrl(dataUrl);
-            setSignatureUrl(uploaded.url);
-            setSigModalOpen(false);
-          }}
-        />
+        {sigModalOpen && (
+          <SignaturePadModal
+            title="Authorized ID Signatory Signature"
+            onClose={() => setSigModalOpen(false)}
+            onSaved={(url) => {
+              setSignatureUrl(url);
+              setSigModalOpen(false);
+            }}
+          />
+        )}
       </div>
     );
   }

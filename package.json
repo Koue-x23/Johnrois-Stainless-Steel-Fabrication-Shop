@@ -8,9 +8,10 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
     "start": "node server/index.js",
-    "dev": "vite build && node server/index.js"
+    "dev": "tsc --noEmit && vite build && node server/index.js"
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
