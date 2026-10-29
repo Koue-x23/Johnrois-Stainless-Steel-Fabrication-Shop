@@ -188,6 +188,10 @@ const SERIAL_ID_TABLES = new Set([
   'service_report_photos',
   'billing_statements',
   'billing_statement_lines',
+  'employees',
+  'payslips',
+  'certificates_of_employment',
+  'employee_id_cards',
   'activity_logs',
 ]);
 
@@ -277,6 +281,10 @@ const SQLITE_SCHEMA_STATEMENTS = [
     customer_prefix TEXT NOT NULL DEFAULT 'CUST',
     product_prefix TEXT NOT NULL DEFAULT 'ITEM',
     payment_prefix TEXT NOT NULL DEFAULT 'PAY',
+    employee_prefix TEXT NOT NULL DEFAULT 'EMP',
+    payslip_prefix TEXT NOT NULL DEFAULT 'PSL',
+    coe_prefix TEXT NOT NULL DEFAULT 'COE',
+    id_card_prefix TEXT NOT NULL DEFAULT 'IDC',
     doc_number_padding INTEGER NOT NULL DEFAULT 4,
     include_year_in_doc_num INTEGER NOT NULL DEFAULT 1,
     default_payment_terms TEXT NOT NULL DEFAULT '50% Downpayment upon confirmation; 50% Balance upon completion/delivery',
@@ -545,6 +553,123 @@ const SQLITE_SCHEMA_STATEMENTS = [
     actor_name TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS employees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    employee_code TEXT UNIQUE NOT NULL,
+    full_name TEXT NOT NULL,
+    position_title TEXT NOT NULL,
+    department TEXT NOT NULL DEFAULT '',
+    employment_type TEXT NOT NULL DEFAULT 'Regular',
+    employment_status TEXT NOT NULL DEFAULT 'Active',
+    start_date TEXT NOT NULL DEFAULT '',
+    end_date TEXT NOT NULL DEFAULT '',
+    contact_number TEXT NOT NULL DEFAULT '',
+    email TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    emergency_contact_name TEXT NOT NULL DEFAULT '',
+    emergency_contact_number TEXT NOT NULL DEFAULT '',
+    pay_basis TEXT NOT NULL DEFAULT 'daily',
+    default_rate REAL NOT NULL DEFAULT 0,
+    photo_url TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS payslips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payslip_number TEXT UNIQUE NOT NULL,
+    employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    employee_code TEXT NOT NULL,
+    employee_name TEXT NOT NULL,
+    position_title TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    pay_period_start TEXT NOT NULL,
+    pay_period_end TEXT NOT NULL,
+    payment_date TEXT NOT NULL,
+    pay_basis TEXT NOT NULL DEFAULT 'daily' CHECK(pay_basis IN ('daily', 'semi_monthly', 'monthly', 'hourly')),
+    base_rate REAL NOT NULL DEFAULT 0,
+    days_worked REAL NOT NULL DEFAULT 0,
+    hours_worked REAL NOT NULL DEFAULT 0,
+    regular_pay REAL NOT NULL DEFAULT 0,
+    overtime_hours REAL NOT NULL DEFAULT 0,
+    overtime_rate REAL NOT NULL DEFAULT 0,
+    overtime_pay REAL NOT NULL DEFAULT 0,
+    allowances REAL NOT NULL DEFAULT 0,
+    bonuses REAL NOT NULL DEFAULT 0,
+    other_earnings REAL NOT NULL DEFAULT 0,
+    other_earnings_note TEXT NOT NULL DEFAULT '',
+    sss_deduction REAL NOT NULL DEFAULT 0,
+    philhealth_deduction REAL NOT NULL DEFAULT 0,
+    pagibig_deduction REAL NOT NULL DEFAULT 0,
+    withholding_tax REAL NOT NULL DEFAULT 0,
+    cash_advance REAL NOT NULL DEFAULT 0,
+    other_deductions REAL NOT NULL DEFAULT 0,
+    other_deductions_note TEXT NOT NULL DEFAULT '',
+    total_earnings REAL NOT NULL DEFAULT 0,
+    total_deductions REAL NOT NULL DEFAULT 0,
+    net_pay REAL NOT NULL DEFAULT 0,
+    payment_method TEXT NOT NULL DEFAULT 'Cash',
+    remarks TEXT NOT NULL DEFAULT '',
+    prepared_by TEXT NOT NULL DEFAULT '',
+    approved_by TEXT NOT NULL DEFAULT '',
+    employee_signature_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'Issued' CHECK(status IN ('Draft', 'Issued', 'Paid')),
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS certificates_of_employment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    certificate_number TEXT UNIQUE NOT NULL,
+    employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    employee_code TEXT NOT NULL DEFAULT '',
+    employee_name TEXT NOT NULL,
+    position_title TEXT NOT NULL,
+    department TEXT NOT NULL DEFAULT '',
+    employment_type TEXT NOT NULL DEFAULT '',
+    employment_status TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL DEFAULT '',
+    date_issued TEXT NOT NULL,
+    purpose TEXT NOT NULL DEFAULT '',
+    include_salary INTEGER NOT NULL DEFAULT 0,
+    salary_amount REAL NOT NULL DEFAULT 0,
+    salary_period TEXT NOT NULL DEFAULT 'monthly',
+    custom_body TEXT NOT NULL DEFAULT '',
+    signatory_name TEXT NOT NULL DEFAULT '',
+    signatory_title TEXT NOT NULL DEFAULT '',
+    signature_url TEXT NOT NULL DEFAULT '',
+    remarks TEXT NOT NULL DEFAULT '',
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS employee_id_cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_number TEXT UNIQUE NOT NULL,
+    employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL,
+    employee_code TEXT NOT NULL,
+    full_name TEXT NOT NULL,
+    position_title TEXT NOT NULL,
+    department TEXT NOT NULL DEFAULT '',
+    photo_url TEXT NOT NULL DEFAULT '',
+    contact_number TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    emergency_contact_name TEXT NOT NULL DEFAULT '',
+    emergency_contact_number TEXT NOT NULL DEFAULT '',
+    blood_type TEXT NOT NULL DEFAULT '',
+    date_issued TEXT NOT NULL,
+    expiration_date TEXT NOT NULL DEFAULT '',
+    authorized_signatory TEXT NOT NULL DEFAULT '',
+    authorized_title TEXT NOT NULL DEFAULT '',
+    signature_url TEXT NOT NULL DEFAULT '',
+    back_notes TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active', 'Expired', 'Revoked')),
+    is_archived INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE INDEX IF NOT EXISTS idx_quotations_customer ON quotations(customer_id)`,
   `CREATE INDEX IF NOT EXISTS idx_quotations_status ON quotations(status)`,
   `CREATE INDEX IF NOT EXISTS idx_invoices_customer ON invoices(customer_id)`,
@@ -553,6 +678,11 @@ const SQLITE_SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_payments_customer ON payments(customer_id)`,
   `CREATE INDEX IF NOT EXISTS idx_service_reports_customer ON service_reports(customer_id)`,
   `CREATE INDEX IF NOT EXISTS idx_billing_statements_customer ON billing_statements(customer_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(is_active)`,
+  `CREATE INDEX IF NOT EXISTS idx_payslips_employee ON payslips(employee_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_payslips_period ON payslips(pay_period_start, pay_period_end)`,
+  `CREATE INDEX IF NOT EXISTS idx_coe_employee ON certificates_of_employment(employee_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_id_cards_employee ON employee_id_cards(employee_id)`,
   `CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at DESC)`,
 ];
 
@@ -577,6 +707,10 @@ const POSTGRES_COLUMN_MIGRATIONS = [
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_enabled INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_label TEXT NOT NULL DEFAULT 'VAT'",
   "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS tax_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS employee_prefix TEXT NOT NULL DEFAULT 'EMP'",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS payslip_prefix TEXT NOT NULL DEFAULT 'PSL'",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS coe_prefix TEXT NOT NULL DEFAULT 'COE'",
+  "ALTER TABLE business_settings ADD COLUMN IF NOT EXISTS id_card_prefix TEXT NOT NULL DEFAULT 'IDC'",
   "ALTER TABLE customers ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE products_services ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE quotations ADD COLUMN IF NOT EXISTS converted_invoice_id INTEGER DEFAULT NULL",
@@ -586,6 +720,13 @@ const POSTGRES_COLUMN_MIGRATIONS = [
   "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS customer_signature_url TEXT NOT NULL DEFAULT ''",
   "ALTER TABLE service_reports ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
   "ALTER TABLE billing_statements ADD COLUMN IF NOT EXISTS is_archived INTEGER NOT NULL DEFAULT 0",
+];
+
+const SQLITE_COLUMN_MIGRATIONS = [
+  "ALTER TABLE business_settings ADD COLUMN employee_prefix TEXT NOT NULL DEFAULT 'EMP'",
+  "ALTER TABLE business_settings ADD COLUMN payslip_prefix TEXT NOT NULL DEFAULT 'PSL'",
+  "ALTER TABLE business_settings ADD COLUMN coe_prefix TEXT NOT NULL DEFAULT 'COE'",
+  "ALTER TABLE business_settings ADD COLUMN id_card_prefix TEXT NOT NULL DEFAULT 'IDC'",
 ];
 
 function isTransientPostgresError(err) {
@@ -756,6 +897,11 @@ async function createLibsqlAdapter(url, authToken) {
       for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
         await client.execute(stmt);
       }
+      for (const alterStmt of SQLITE_COLUMN_MIGRATIONS) {
+        try {
+          await client.execute(alterStmt);
+        } catch (_) {}
+      }
     },
     async get(sql, params = []) {
       const res = await getExecutor().execute({ sql, args: params });
@@ -815,6 +961,11 @@ async function createNodeSqliteAdapter(sqliteFilePath) {
     async initSchema() {
       for (const stmt of SQLITE_SCHEMA_STATEMENTS) {
         sqlite.exec(stmt);
+      }
+      for (const alterStmt of SQLITE_COLUMN_MIGRATIONS) {
+        try {
+          sqlite.exec(alterStmt);
+        } catch (_) {}
       }
     },
     async get(sql, params = []) {
@@ -1106,10 +1257,14 @@ export function formatDocNumber(settings, type, nextVal, yearStr) {
     customer: settings.customer_prefix || 'CUST',
     product: settings.product_prefix || 'ITEM',
     payment: settings.payment_prefix || 'PAY',
+    employee: settings.employee_prefix || 'EMP',
+    payslip: settings.payslip_prefix || 'PSL',
+    coe: settings.coe_prefix || 'COE',
+    id_card: settings.id_card_prefix || 'IDC',
   };
   const prefix = (prefixMap[type] || 'DOC').trim().toUpperCase();
   const numPart = String(nextVal).padStart(pad, '0');
-  if (type === 'customer' || type === 'product') {
+  if (type === 'customer' || type === 'product' || type === 'employee') {
     return `${prefix}-${numPart}`;
   }
   return includeYear ? `${prefix}-${yearStr}-${numPart}` : `${prefix}-${numPart}`;
@@ -1119,7 +1274,7 @@ export async function previewNextDocNumber(type, dateStr = todayYMD()) {
   const settings = await getSettings();
   const yearStr = dateStr && dateStr.length >= 4 ? dateStr.slice(0, 4) : todayYMD().slice(0, 4);
   const seqKey =
-    type === 'customer' || type === 'product'
+    type === 'customer' || type === 'product' || type === 'employee'
       ? type.toUpperCase()
       : `${type.toUpperCase()}-${yearStr}`;
   const row = await dbGet('SELECT last_val FROM document_sequences WHERE seq_key = ?', [seqKey]);
@@ -1131,7 +1286,7 @@ export async function allocateNextDocNumber(type, dateStr = todayYMD()) {
   const settings = await getSettings();
   const yearStr = dateStr && dateStr.length >= 4 ? dateStr.slice(0, 4) : todayYMD().slice(0, 4);
   const seqKey =
-    type === 'customer' || type === 'product'
+    type === 'customer' || type === 'product' || type === 'employee'
       ? type.toUpperCase()
       : `${type.toUpperCase()}-${yearStr}`;
 
@@ -1143,6 +1298,10 @@ export async function allocateNextDocNumber(type, dateStr = todayYMD()) {
     customer: ['customers', 'customer_code'],
     product: ['products_services', 'item_code'],
     payment: ['payments', 'payment_number'],
+    employee: ['employees', 'employee_code'],
+    payslip: ['payslips', 'payslip_number'],
+    coe: ['certificates_of_employment', 'certificate_number'],
+    id_card: ['employee_id_cards', 'card_number'],
   };
   const [table, col] = tableColumnMap[type];
 

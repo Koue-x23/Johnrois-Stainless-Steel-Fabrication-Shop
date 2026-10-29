@@ -29,6 +29,10 @@ export interface BusinessSettings {
   customer_prefix: string;
   product_prefix: string;
   payment_prefix: string;
+  employee_prefix?: string;
+  payslip_prefix?: string;
+  coe_prefix?: string;
+  id_card_prefix?: string;
   doc_number_padding: number;
   include_year_in_doc_num: number;
   default_payment_terms: string;
@@ -281,6 +285,10 @@ export type NavSection =
   | 'products'
   | 'payments'
   | 'reports'
+  | 'employees'
+  | 'payslips'
+  | 'certificates-of-employment'
+  | 'employee-ids'
   | 'settings';
 
 export interface NavigationTarget {
@@ -288,4 +296,132 @@ export interface NavigationTarget {
   openId?: number;
   createNew?: boolean;
   prefillCustomerId?: number;
+  prefillEmployeeId?: number;
+}
+
+export type PayBasis = 'daily' | 'semi_monthly' | 'monthly' | 'hourly';
+
+export interface Employee {
+  id: number;
+  employee_code: string;
+  full_name: string;
+  position_title: string;
+  department: string;
+  employment_type: string;
+  employment_status: string;
+  start_date: string;
+  end_date: string;
+  contact_number: string;
+  email: string;
+  address: string;
+  emergency_contact_name: string;
+  emergency_contact_number: string;
+  pay_basis: PayBasis;
+  default_rate: number;
+  photo_url: string;
+  notes: string;
+  is_active: number;
+  payslip_count?: number;
+  coe_count?: number;
+  id_card_count?: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export type PayslipStatus = 'Draft' | 'Issued' | 'Paid';
+
+export interface Payslip {
+  id: number;
+  payslip_number: string;
+  employee_id: number | null;
+  employee_code: string;
+  employee_name: string;
+  position_title: string;
+  department: string;
+  pay_period_start: string;
+  pay_period_end: string;
+  payment_date: string;
+  pay_basis: PayBasis;
+  base_rate: number;
+  days_worked: number;
+  hours_worked: number;
+  regular_pay: number;
+  overtime_hours: number;
+  overtime_rate: number;
+  overtime_pay: number;
+  allowances: number;
+  bonuses: number;
+  other_earnings: number;
+  other_earnings_note: string;
+  sss_deduction: number;
+  philhealth_deduction: number;
+  pagibig_deduction: number;
+  withholding_tax: number;
+  cash_advance: number;
+  other_deductions: number;
+  other_deductions_note: string;
+  total_earnings: number;
+  total_deductions: number;
+  net_pay: number;
+  payment_method: string;
+  remarks: string;
+  prepared_by: string;
+  approved_by: string;
+  employee_signature_url: string;
+  status: PayslipStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CertificateOfEmployment {
+  id: number;
+  certificate_number: string;
+  employee_id: number | null;
+  employee_code: string;
+  employee_name: string;
+  position_title: string;
+  department: string;
+  employment_type: string;
+  employment_status: string;
+  start_date: string;
+  end_date: string;
+  date_issued: string;
+  purpose: string;
+  include_salary: number;
+  salary_amount: number;
+  salary_period: string;
+  custom_body: string;
+  signatory_name: string;
+  signatory_title: string;
+  signature_url: string;
+  remarks: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export type IdCardStatus = 'Active' | 'Expired' | 'Revoked';
+
+export interface EmployeeIdCard {
+  id: number;
+  card_number: string;
+  employee_id: number | null;
+  employee_code: string;
+  full_name: string;
+  position_title: string;
+  department: string;
+  photo_url: string;
+  contact_number: string;
+  address: string;
+  emergency_contact_name: string;
+  emergency_contact_number: string;
+  blood_type: string;
+  date_issued: string;
+  expiration_date: string;
+  authorized_signatory: string;
+  authorized_title: string;
+  signature_url: string;
+  back_notes: string;
+  status: IdCardStatus;
+  created_at: string;
+  updated_at: string;
 }

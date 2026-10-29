@@ -264,7 +264,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                   )}
                 </div>
                 <p className="text-[11px] text-slate-500">
-                  Appears on Quotations, Invoices, Service Reports, and Billing Statements.
+                  Appears on Quotations, Invoices, Service Reports, Billing Statements, Payslips, Certificates of Employment, and Employee ID Cards.
                 </p>
               </div>
             </div>
@@ -437,6 +437,50 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
                     setForm({ ...form, doc_number_padding: Number(e.target.value) || 4 })
                   }
                   className="w-full px-2.5 py-1.5 text-sm tabular-nums border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase text-slate-600 mb-1">
+                  Employee ID Prefix
+                </label>
+                <input
+                  type="text"
+                  value={form.employee_prefix || 'EMP'}
+                  onChange={(e) => setForm({ ...form, employee_prefix: e.target.value })}
+                  className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase text-slate-600 mb-1">
+                  Payslip Prefix
+                </label>
+                <input
+                  type="text"
+                  value={form.payslip_prefix || 'PSL'}
+                  onChange={(e) => setForm({ ...form, payslip_prefix: e.target.value })}
+                  className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase text-slate-600 mb-1">
+                  COE Prefix
+                </label>
+                <input
+                  type="text"
+                  value={form.coe_prefix || 'COE'}
+                  onChange={(e) => setForm({ ...form, coe_prefix: e.target.value })}
+                  className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] font-semibold uppercase text-slate-600 mb-1">
+                  ID Card Ref Prefix
+                </label>
+                <input
+                  type="text"
+                  value={form.id_card_prefix || 'IDC'}
+                  onChange={(e) => setForm({ ...form, id_card_prefix: e.target.value })}
+                  className="w-full px-2.5 py-1.5 text-sm font-mono border border-slate-300 rounded"
                 />
               </div>
             </div>
@@ -613,7 +657,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({
           <div className="bg-white border border-slate-200 rounded-md p-5 space-y-3">
             <h2 className="text-sm font-bold text-slate-900">Export Complete System Backup</h2>
             <p className="text-xs text-slate-600">
-              Downloads a complete snapshot of your SQLite database—including business settings, customers, products, quotations, invoices, payments, service reports, billing statements, and uploaded logo/signature/photo files—into a single portable JSON file.
+              Downloads a complete snapshot of your database—including business settings, customers, products, quotations, invoices, payments, service reports, billing statements, employee directory, payslips, COEs, employee IDs, and uploaded logo/signature/photo files—into a single portable JSON file.
             </p>
             <button
               type="button"

@@ -35,6 +35,19 @@
 /* ============================================================================
    DEDICATED A4 PRINT DOCUMENT STYLES (COMPLETELY SEPARATE FROM DASHBOARD UI)
    ============================================================================ */
+/* Standard ISO/IEC 7810 ID-1 (CR80) Portrait Card Dimensions: 54.0mm x 85.6mm */
+.cr80-card {
+  width: 54mm;
+  height: 85.6mm;
+  min-width: 54mm;
+  min-height: 85.6mm;
+  max-width: 54mm;
+  max-height: 85.6mm;
+  box-sizing: border-box;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
 @page {
   size: A4 portrait;
   margin: 12mm 14mm;
@@ -48,6 +61,8 @@
   .app-main-scroll {
     background: #ffffff !important;
     color: #000000 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
     height: auto !important;
     min-height: 0 !important;
     max-height: none !important;
