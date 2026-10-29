@@ -928,6 +928,15 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
             </div>
           </div>
 
+          {error && (
+            <div
+              role="alert"
+              className="p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700 font-medium"
+            >
+              {error}
+            </div>
+          )}
+
           <div className="flex justify-end gap-2.5 pt-4 border-t border-slate-200">
             <button
               type="button"

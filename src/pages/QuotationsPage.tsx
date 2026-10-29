@@ -307,6 +307,11 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
           });
 
       setActiveQuote(res.quotation);
+      setNotice(
+        editingId
+          ? `Quotation ${res.quotation.quotation_number} updated and saved.`
+          : `Quotation ${res.quotation.quotation_number} saved successfully.`
+      );
       fetchQuotations();
       setMode('preview');
     } catch (err: any) {
@@ -698,6 +703,15 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
               />
             </div>
           </div>
+
+          {error && (
+            <div
+              role="alert"
+              className="p-3 rounded bg-rose-50 border border-rose-200 text-xs text-rose-700 font-medium"
+            >
+              {error}
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center justify-end gap-2.5 pt-4 border-t border-slate-200">
             <button
